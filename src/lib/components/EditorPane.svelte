@@ -7,7 +7,6 @@
     lineNumbers,
     highlightActiveLine,
     highlightActiveLineGutter,
-    drawSelection,
   } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
   import { search, searchKeymap, openSearchPanel } from "@codemirror/search";
@@ -38,7 +37,6 @@
       lineNumbers(),
       highlightActiveLine(),
       highlightActiveLineGutter(),
-      drawSelection(),
       history(),
       search({ top: true }),
       wrapCompartment.of(wrap ? EditorView.lineWrapping : []),
@@ -65,6 +63,12 @@
           caretColor: "var(--accent)",
           padding: "12px 20px 12px 14px",
         },
+        ".cm-content ::selection": {
+          backgroundColor: "rgba(47, 111, 237, 0.25)",
+        },
+        ".cm-line ::selection": {
+          backgroundColor: "rgba(47, 111, 237, 0.25)",
+        },
         ".cm-gutters": {
           backgroundColor: "var(--bg-editor)",
           color: "var(--ink-faint)",
@@ -78,12 +82,6 @@
         },
         ".cm-activeLine": {
           backgroundColor: "var(--bg-active)",
-        },
-        ".cm-selectionBackground": {
-          backgroundColor: "rgba(47, 111, 237, 0.18) !important",
-        },
-        "&.cm-focused .cm-selectionBackground": {
-          backgroundColor: "rgba(47, 111, 237, 0.22) !important",
         },
         ".cm-scroller": {
           fontFamily: "var(--mono)",
