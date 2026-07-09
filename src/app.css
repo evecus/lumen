@@ -1,0 +1,77 @@
+:root {
+  /* 现代、明亮、简洁的白底配色 */
+  --bg-app: #ffffff;
+  --bg-panel: #f7f8fa;
+  --bg-editor: #ffffff;
+  --bg-raised: #ffffff;
+  --bg-hover: #f0f2f5;
+  --bg-active: #eef1f6;
+  --bg-accent-soft: #eaf3ff;
+
+  --ink: #1f2430;
+  --ink-dim: #6b7280;
+  --ink-faint: #a1a8b3;
+
+  --border: #e4e7ec;
+  --border-strong: #d3d8e0;
+
+  --accent: #2f6fed;
+  --accent-hover: #1f5be0;
+  --accent-soft: #eaf3ff;
+  --warn: #e0a458;
+  --danger: #e5484d;
+  --danger-soft: #fdecec;
+  --success: #2fb380;
+
+  --mono: "Cascadia Code", "Consolas", "JetBrains Mono", ui-monospace, monospace;
+  --ui: "Segoe UI", -apple-system, "Microsoft YaHei", sans-serif;
+
+  --radius-sm: 5px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  --shadow-sm: 0 1px 2px rgba(20, 24, 33, 0.06);
+  --shadow-md: 0 8px 24px rgba(20, 24, 33, 0.12);
+  --shadow-lg: 0 20px 50px rgba(20, 24, 33, 0.18);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--ui);
+  background: var(--bg-app);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+button {
+  font-family: var(--ui);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d5d9e0;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #b8bec8;
+  background-clip: content-box;
+}
