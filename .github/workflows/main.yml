@@ -61,4 +61,4 @@ jobs:
           name: Lumen ${{ inputs.version }}
           prerelease: false
           make_latest: true
-          file: src-tauri/target/release/bundle/nsis/*.exe
+          files: src-tauri/target/release/bundle/nsis/*.exe
