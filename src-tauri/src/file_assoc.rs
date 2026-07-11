@@ -9,16 +9,66 @@
 // 已经有默认程序的格式，用户也可以随时在右键菜单的"打开方式"里手动选择 Lumen，
 // 或者在 Lumen 里点"设为默认"直接把当前文件类型的默认程序设为 Lumen。
 pub const COMMON_EXTENSIONS: &[&str] = &[
-    // 纯文本
-    "txt", "log", "md",
+    // 纯文本 / 文档
+    "txt", "log", "md", "markdown", "rst", "adoc", "asciidoc", "text", "me", "nfo",
     // Web 前端
-    "html", "htm", "css", "js", "jsx", "ts", "tsx", "json",
-    // 后端 / 系统语言
-    "py", "java", "c", "cpp", "h", "cs", "go", "rs", "php", "rb",
-    // 配置 / 数据
-    "ini", "conf", "yml", "yaml", "xml", "toml", "env",
-    // 脚本
-    "sh", "bat", "ps1",
+    "html", "htm", "xhtml", "css", "scss", "sass", "less", "styl",
+    "js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts", "vue", "svelte", "astro",
+    "json", "json5", "jsonc", "webmanifest", "map",
+    // 后端 / 通用编程语言
+    "py", "pyw", "pyi",
+    "java", "kt", "kts", "groovy", "scala", "clj", "cljs", "cljc",
+    "c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "hh",
+    "cs", "csx", "vb", "fs", "fsx",
+    "go", "rs",
+    "php", "phtml",
+    "rb", "erb", "rake", "gemspec",
+    "swift",
+    "dart",
+    "lua",
+    "pl", "pm",
+    "r", "rmd",
+    "jl",
+    "ex", "exs", "erl", "hrl",
+    "hs", "lhs",
+    "ml", "mli",
+    "nim",
+    "zig",
+    "v", "sv",
+    "asm", "s",
+    "sql", "psql", "plsql",
+    "graphql", "gql",
+    "proto",
+    "wat",
+    // 配置 / 数据 / 标记语言
+    "ini", "cfg", "conf", "config", "properties",
+    "yml", "yaml",
+    "toml",
+    "xml", "xsd", "xsl", "xslt", "dtd", "plist",
+    "csv", "tsv",
+    "env", "envrc",
+    "editorconfig", "gitignore", "gitattributes", "dockerignore", "npmignore",
+    "lock",
+    // 脚本 / Shell / 自动化
+    "sh", "bash", "zsh", "fish", "ksh",
+    "bat", "cmd",
+    "ps1", "psm1", "psd1",
+    "awk", "sed",
+    "makefile", "mk", "cmake", "gradle",
+    "dockerfile",
+    "vagrantfile",
+    "gitconfig",
+    // 模板引擎 / 文档标记
+    "tpl", "twig", "jinja", "jinja2", "j2", "hbs", "handlebars", "mustache", "ejs", "pug", "jade", "haml", "slim",
+    "tex", "bib", "cls", "sty",
+    "wiki",
+    // 其他常见开发相关纯文本格式
+    "srt", "vtt", "ass", "sub",
+    "diff", "patch",
+    "reg",
+    "manifest",
+    "htaccess",
+    "url", "desktop",
 ];
 
 #[cfg(target_os = "windows")]

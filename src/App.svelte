@@ -6,6 +6,7 @@
   import EditorPane from "./lib/components/EditorPane.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import Toast from "./lib/components/Toast.svelte";
+  import NewFileDialog from "./lib/components/NewFileDialog.svelte";
   import { tabs, activeTab, createTab } from "./lib/store";
   import { openFileByPath, openFileDialog, saveTab, saveTabAs } from "./lib/fileActions";
   import { setActiveTabExtensionAsDefault } from "./lib/fileAssocActions";
@@ -15,6 +16,7 @@
 
   let sidebarVisible = true;
   let editorPaneRef;
+  let newFileDialogOpen = false;
 
   onMount(async () => {
     // 处理程序启动时通过"打开方式"传入的文件路径
@@ -23,6 +25,8 @@
       if (launchFile) {
         await openFileByPath(launchFile);
       } else {
+        // 启动时的初始空白标签不弹窗，直接给一个默认名字，
+        // 弹窗只在用户主动点"新建"/按 Ctrl+N 时出现。
         createTab({ name: "未命名-1.txt" });
       }
     } catch (e) {
@@ -37,6 +41,20 @@
     return () => unlisten();
   });
 
+  function openNewFileDialog() {
+    newFileDialogOpen = true;
+  }
+
+  function handleNewFileConfirm(e) {
+    const { name } = e.detail;
+    createTab({ name });
+    newFileDialogOpen = false;
+  }
+
+  function handleNewFileCancel() {
+    newFileDialogOpen = false;
+  }
+
   // 注意：查找 (Ctrl+F)、替换 (Ctrl+H)、撤销重做等快捷键
   // 现在由 CodeMirror 自己的 keymap 处理（只要编辑器有焦点），
   // 这里的全局快捷键只处理 CodeMirror 管不到的应用级操作：
@@ -47,7 +65,7 @@
 
     if (ctrl && key === "n") {
       e.preventDefault();
-      createTab({ name: `未命名-${$tabs.length + 1}.txt` });
+      openNewFileDialog();
     } else if (ctrl && key === "o") {
       e.preventDefault();
       openFileDialog();
@@ -68,12 +86,13 @@
   <Toolbar
     bind:sidebarVisible
     activeTab={$activeTab}
+    on:new-file={openNewFileDialog}
     on:open-search={() => editorPaneRef && editorPaneRef.focusSearch()}
     on:set-default={() => setActiveTabExtensionAsDefault($activeTab)}
   />
   <div class="body-wrap">
     {#if sidebarVisible}
-      <Sidebar />
+      <Sidebar on:new-file={openNewFileDialog} />
     {/if}
     <div class="editor-area">
       <EditorPane bind:this={editorPaneRef} />
@@ -81,6 +100,14 @@
   </div>
   <StatusBar />
 </div>
+
+{#if newFileDialogOpen}
+  <NewFileDialog
+    defaultName={`未命名-${$tabs.length + 1}.txt`}
+    on:confirm={handleNewFileConfirm}
+    on:cancel={handleNewFileCancel}
+  />
+{/if}
 
 <Toast />
 

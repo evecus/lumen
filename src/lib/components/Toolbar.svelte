@@ -1,20 +1,15 @@
 <script>
   import { createEventDispatcher } from "svelte";
-  import { tabs, createTab } from "../store";
   import { openFileDialog, saveTab } from "../fileActions";
 
   export let sidebarVisible = true;
   export let activeTab = null;
 
   const dispatch = createEventDispatcher();
-
-  function handleNew() {
-    createTab({ name: `未命名-${$tabs.length + 1}.txt` });
-  }
 </script>
 
 <div class="toolbar">
-  <button class="tb-btn" title="新建 (Ctrl+N)" on:click={handleNew}>
+  <button class="tb-btn" title="新建 (Ctrl+N)" on:click={() => dispatch("new-file")}>
     <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
     新建
   </button>

@@ -1,6 +1,8 @@
 <script>
-  import { tabs, activeTabId, closeTab, setActiveTab, createTab } from "../store";
-  import { saveTab } from "../fileActions";
+  import { createEventDispatcher } from "svelte";
+  import { tabs, activeTabId, closeTab, setActiveTab } from "../store";
+
+  const dispatch = createEventDispatcher();
 
   async function handleClose(e, tab) {
     e.stopPropagation();
@@ -29,10 +31,7 @@
     {/each}
   </div>
   <div class="sidebar-foot">
-    <button
-      class="newfile-btn"
-      on:click={() => createTab({ name: `未命名-${$tabs.length + 1}.txt` })}
-    >
+    <button class="newfile-btn" on:click={() => dispatch("new-file")}>
       + 新建文件
     </button>
   </div>
