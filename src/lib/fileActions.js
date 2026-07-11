@@ -69,13 +69,21 @@ export async function saveTab(tab) {
   if (!tab) return;
   if (tab.path) {
     try {
-      await invoke("write_text_file", {
+      const result = await invoke("write_text_file", {
         path: tab.path,
         content: tab.content,
         eol: tab.eol || "LF",
+        encoding: tab.encoding || "UTF-8",
       });
       markSaved(tab.id, tab.path, tab.name);
-      showToast(`已保存 “${tab.name}”`, "success");
+      if (result && result.had_unmappable_chars) {
+        showToast(
+          `已保存 “${tab.name}”，但部分字符无法用 ${tab.encoding} 表示，已替换为 ?`,
+          "info"
+        );
+      } else {
+        showToast(`已保存 “${tab.name}”`, "success");
+      }
     } catch (e) {
       showToast(`保存失败：${e}`, "error");
     }
@@ -92,13 +100,21 @@ export async function saveTabAs(tab) {
   });
   if (!targetPath) return;
   try {
-    await invoke("write_text_file", {
+    const result = await invoke("write_text_file", {
       path: targetPath,
       content: tab.content,
       eol: tab.eol || "LF",
+      encoding: tab.encoding || "UTF-8",
     });
     markSaved(tab.id, targetPath, basename(targetPath));
-    showToast(`已保存 “${basename(targetPath)}”`, "success");
+    if (result && result.had_unmappable_chars) {
+      showToast(
+        `已保存 “${basename(targetPath)}”，但部分字符无法用 ${tab.encoding} 表示，已替换为 ?`,
+        "info"
+      );
+    } else {
+      showToast(`已保存 “${basename(targetPath)}”`, "success");
+    }
   } catch (e) {
     showToast(`保存失败：${e}`, "error");
   }

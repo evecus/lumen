@@ -5,11 +5,22 @@
 
   const dispatch = createEventDispatcher();
 
+  const ENCODING_OPTIONS = [
+    { value: "UTF-8", label: "UTF-8（推荐，适合绝大多数文件）" },
+    { value: "GBK", label: "GBK（简体中文，适合 .bat 等需要兼容旧版 Windows 的文件）" },
+    { value: "GB18030", label: "GB18030（GBK 的超集，兼容性更广）" },
+    { value: "BIG5", label: "Big5（繁体中文）" },
+    { value: "UTF-16LE", label: "UTF-16 LE" },
+    { value: "UTF-16BE", label: "UTF-16 BE" },
+    { value: "SHIFT-JIS", label: "Shift-JIS（日文）" },
+  ];
+
   let filename = defaultName;
+  let encoding = "UTF-8";
   let inputEl;
   let errorMsg = "";
 
-  // 弹窗打开时自动聚焦，并且只选中"文件名主体"部分（不含扩展名），
+  // 弹窗打开时自动聚焦，并且只选中"文件名主体"部分（不含扩展名，如果有的话），
   // 这样用户直接打字就能替换文件名，同时保留默认扩展名，体验更顺手。
   async function focusAndSelect() {
     await tick();
@@ -25,13 +36,12 @@
 
   focusAndSelect();
 
+  // 文件名不强制要求带扩展名：像 Makefile、Dockerfile、LICENSE 这类
+  // 约定俗成没有扩展名的文件也是合法的，只校验文件名本身不含非法字符。
   function validate(name) {
     const trimmed = name.trim();
     if (!trimmed) return "文件名不能为空";
     if (/[\\/:*?"<>|]/.test(trimmed)) return '文件名不能包含 \\ / : * ? " < > |';
-    if (!trimmed.includes(".") || trimmed.endsWith(".")) {
-      return "请包含文件扩展名，例如 123.json";
-    }
     return "";
   }
 
@@ -41,7 +51,7 @@
       errorMsg = err;
       return;
     }
-    dispatch("confirm", { name: filename.trim() });
+    dispatch("confirm", { name: filename.trim(), encoding });
   }
 
   function handleCancel() {
@@ -69,7 +79,7 @@
       <h2>新建文件</h2>
     </div>
     <div class="dialog-body">
-      <label class="field-label" for="new-file-name">文件名（含扩展名）</label>
+      <label class="field-label" for="new-file-name">文件名</label>
       <input
         id="new-file-name"
         type="text"
@@ -77,14 +87,27 @@
         bind:value={filename}
         on:keydown={handleKeydown}
         on:input={handleInput}
-        placeholder="例如 123.json、notes.md、script.py"
+        placeholder="例如 123.json、notes.md、Dockerfile"
         class:has-error={!!errorMsg}
       />
       {#if errorMsg}
         <div class="error-text">{errorMsg}</div>
       {:else}
-        <div class="hint-text">支持任意扩展名，例如 .txt .md .json .py .js 等</div>
+        <div class="hint-text">
+          可以带扩展名（如 .txt .py），也可以不带（如 Makefile、LICENSE）
+        </div>
       {/if}
+
+      <label class="field-label encoding-label" for="new-file-encoding">保存编码</label>
+      <select id="new-file-encoding" bind:value={encoding} on:keydown={handleKeydown}>
+        {#each ENCODING_OPTIONS as opt}
+          <option value={opt.value}>{opt.label}</option>
+        {/each}
+      </select>
+      <div class="hint-text">
+        大部分情况用 UTF-8 即可；如果要新建 .bat/.cmd 等在简体中文 Windows
+        上运行、且包含中文的批处理脚本，选 GBK 可以避免中文显示乱码。
+      </div>
     </div>
     <div class="dialog-foot">
       <button class="btn" on:click={handleCancel}>取消</button>
@@ -104,7 +127,7 @@
     z-index: 100;
   }
   .dialog {
-    width: 400px;
+    width: 420px;
     background: #fff;
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
@@ -128,7 +151,11 @@
     color: var(--ink-dim);
     margin-bottom: 6px;
   }
-  input {
+  .encoding-label {
+    margin-top: 16px;
+  }
+  input,
+  select {
     width: 100%;
     padding: 9px 11px;
     border: 1px solid var(--border-strong);
@@ -139,7 +166,13 @@
     background: #fff;
     color: var(--ink);
   }
-  input:focus {
+  select {
+    font-family: var(--ui);
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  input:focus,
+  select:focus {
     border-color: var(--accent);
   }
   input.has-error {
@@ -149,6 +182,7 @@
     font-size: 11px;
     color: var(--ink-faint);
     margin-top: 6px;
+    line-height: 1.5;
   }
   .error-text {
     font-size: 11px;

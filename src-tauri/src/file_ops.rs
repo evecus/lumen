@@ -99,10 +99,59 @@ pub fn read_text_file(path: String) -> Result<FileReadResult, String> {
     })
 }
 
+/// 根据编码名字符串找到对应的 encoding_rs::Encoding。
+/// 支持常见的别名写法（不区分大小写），找不到时默认回退到 UTF-8。
+fn resolve_encoding(name: &str) -> &'static Encoding {
+    let normalized = name.trim().to_uppercase().replace('_', "-");
+    match normalized.as_str() {
+        "UTF-8" | "UTF8" | "UTF-8 (BOM)" => encoding_rs::UTF_8,
+        "GBK" | "GB2312" | "CP936" => encoding_rs::GBK,
+        "GB18030" => encoding_rs::GB18030,
+        "BIG5" | "BIG-5" => encoding_rs::BIG5,
+        "UTF-16LE" | "UTF-16 LE" => encoding_rs::UTF_16LE,
+        "UTF-16BE" | "UTF-16 BE" => encoding_rs::UTF_16BE,
+        "SHIFT-JIS" | "SHIFT_JIS" | "SJIS" => encoding_rs::SHIFT_JIS,
+        "EUC-KR" => encoding_rs::EUC_KR,
+        "ISO-8859-1" | "LATIN1" | "WINDOWS-1252" => encoding_rs::WINDOWS_1252,
+        _ => encoding_rs::UTF_8,
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WriteResult {
+    /// 保存过程中是否有字符无法用目标编码表示（会被替换为 ?）。
+    /// 这种情况下文件仍然被写入了，只是内容有损，前端可以据此提示用户。
+    pub had_unmappable_chars: bool,
+}
+
 #[tauri::command]
-pub fn write_text_file(path: String, content: String, eol: String) -> Result<(), String> {
+pub fn write_text_file(
+    path: String,
+    content: String,
+    eol: String,
+    encoding: Option<String>,
+) -> Result<WriteResult, String> {
     let normalized = normalize_eol(&content, &eol);
-    fs::write(&path, normalized).map_err(|e| format!("保存文件失败: {}", e))
+    let enc = resolve_encoding(encoding.as_deref().unwrap_or("UTF-8"));
+
+    if enc == encoding_rs::UTF_8 {
+        // UTF-8 直接写字节，避免不必要的编码往返
+        fs::write(&path, normalized).map_err(|e| format!("保存文件失败: {}", e))?;
+        Ok(WriteResult {
+            had_unmappable_chars: false,
+        })
+    } else {
+        // 非 UTF-8 编码（例如 GBK）：把字符串编码成目标字节序列再写入。
+        // 编码过程中遇到目标编码无法表示的字符会被替换为 '?'，
+        // 这是 encoding_rs 的标准行为；文件仍然会被正常写入，
+        // 只是把"有损"这件事通过返回值告诉前端，由前端决定怎么提示用户，
+        // 不应该当作保存失败处理。
+        let (bytes, _, had_unmappable) = enc.encode(&normalized);
+        fs::write(&path, bytes.as_ref()).map_err(|e| format!("保存文件失败: {}", e))?;
+        Ok(WriteResult {
+            had_unmappable_chars: had_unmappable,
+        })
+    }
 }
 
 fn normalize_eol(text: &str, eol: &str) -> String {

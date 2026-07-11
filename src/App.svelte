@@ -46,8 +46,8 @@
   }
 
   function handleNewFileConfirm(e) {
-    const { name } = e.detail;
-    createTab({ name });
+    const { name, encoding } = e.detail;
+    createTab({ name, encoding: encoding || "UTF-8" });
     newFileDialogOpen = false;
   }
 
