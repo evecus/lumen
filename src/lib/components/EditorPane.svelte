@@ -9,7 +9,16 @@
     highlightActiveLineGutter,
   } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-  import { search, searchKeymap, openSearchPanel } from "@codemirror/search";
+  import {
+    search,
+    setSearchQuery,
+    SearchQuery,
+    findNext,
+    findPrevious,
+    replaceNext,
+    replaceAll as cmReplaceAll,
+    getSearchQuery,
+  } from "@codemirror/search";
   import { activeTab, updateTabContent } from "../store";
 
   // ===== 为什么换成 CodeMirror 6 =====
@@ -17,8 +26,9 @@
   // 也没有真正的视口虚拟化能力。CodeMirror 6 把这些都做成了内置能力：
   //   - lineWrapping 打开后，行号只出现在每个逻辑行的第一屏视觉行，折行部分自动留空
   //   - 内部本身就是虚拟滚动的编辑器内核，大文件不需要我们自己维护可见区间
-  //   - 查找替换直接用官方 @codemirror/search 扩展和它自带的搜索面板，
-  //     不用自己维护正则匹配、选区计算这些逻辑
+  //   - 查找替换的底层引擎（正则匹配、增量高亮、大小写/全词选项）用官方
+  //     @codemirror/search 模块，但 UI 完全是我们自己写的 SearchPanel.svelte
+  //     浮层组件，不使用它自带的面板样式（见下面 createExtensions 里的注释）
 
   let editorContainer;
   let view = null;
@@ -31,12 +41,24 @@
       highlightActiveLine(),
       highlightActiveLineGutter(),
       history(),
-      search({ top: true }),
+      // 关键点：CodeMirror 的"匹配高亮"视觉效果（.cm-searchMatch）内部实现
+      // 依赖 search() 扩展存在且有一个 panel 被创建，如果完全不加载 search()，
+      // setSearchQuery/findNext 虽然仍能正确定位/选中匹配项，但不会画出高亮背景。
+      // 所以这里必须保留 search() 扩展本身，但通过 createPanel 提供一个
+      // "什么都不显示、不占用任何布局空间"的空面板，实际的搜索 UI
+      // 完全由我们自己的 SearchPanel.svelte 组件（浮层，不挤压编辑器区域）驱动。
+      search({
+        createPanel: () => {
+          const dom = document.createElement("div");
+          dom.style.display = "none";
+          return { dom, top: true };
+        },
+      }),
       // 自动换行永久开启：长段落超出编辑区宽度时自动折行，避免内容显示不全。
       // 软换行时行号栏只在每个逻辑行的第一屏视觉行显示数字，折行部分自动留空，
       // 这是原生 <textarea> 做不到、必须用 CodeMirror 才能正确实现的效果。
       EditorView.lineWrapping,
-      keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
+      keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
       EditorView.updateListener.of((update) => {
         if (update.docChanged && $activeTab) {
           suppressSync = true;
@@ -83,31 +105,11 @@
           fontFamily: "var(--mono)",
           overflow: "auto",
         },
-        ".cm-panels": {
-          backgroundColor: "var(--bg-panel)",
-          color: "var(--ink)",
-        },
-        ".cm-panels.cm-panels-top": {
-          borderBottom: "1px solid var(--border)",
-        },
         ".cm-searchMatch": {
           backgroundColor: "rgba(224, 164, 88, 0.35)",
         },
         ".cm-searchMatch.cm-searchMatch-selected": {
           backgroundColor: "rgba(47, 111, 237, 0.35)",
-        },
-        ".cm-textfield": {
-          backgroundColor: "#fff",
-          color: "var(--ink)",
-          border: "1px solid var(--border-strong)",
-          borderRadius: "4px",
-        },
-        ".cm-button": {
-          backgroundImage: "none",
-          backgroundColor: "var(--bg-hover)",
-          border: "1px solid var(--border)",
-          borderRadius: "4px",
-          color: "var(--ink)",
         },
       }),
     ];
@@ -154,8 +156,74 @@
     });
   }
 
-  export function focusSearch() {
-    if (view) openSearchPanel(view);
+  // ===== 暴露给外部 SearchPanel 组件使用的搜索接口 =====
+  // 这里只做"转发"：真正的查找/替换逻辑仍然是 CodeMirror 官方的
+  // @codemirror/search 模块实现，我们只是不用它自带的 UI 面板。
+
+  export function getView() {
+    return view;
+  }
+
+  /**
+   * 根据自定义面板收集到的选项构建一个 CodeMirror SearchQuery，并把它设置为
+   * 当前编辑器的搜索状态（这样匹配高亮、后续的 findNext/findPrevious 才能生效）。
+   */
+  export function applySearchQuery({
+    search: searchText,
+    replace,
+    caseSensitive,
+    regexp,
+    wholeWord,
+  }) {
+    if (!view) return null;
+    const query = new SearchQuery({
+      search: searchText,
+      replace: replace ?? "",
+      caseSensitive: !!caseSensitive,
+      regexp: !!regexp,
+      wholeWord: !!wholeWord,
+    });
+    view.dispatch({ effects: setSearchQuery.of(query) });
+    return query;
+  }
+
+  export function goToNextMatch() {
+    if (view) findNext(view);
+  }
+
+  export function goToPreviousMatch() {
+    if (view) findPrevious(view);
+  }
+
+  export function replaceCurrentMatch() {
+    if (view) replaceNext(view);
+  }
+
+  export function replaceAllMatches() {
+    if (view) cmReplaceAll(view);
+  }
+
+  /**
+   * 统计当前查询在整份文档里一共有多少处匹配。
+   * CodeMirror 的 SearchCursor 是惰性遍历的，这里手动跑一遍数出总数，
+   * 用于面板里的"计数"按钮和"第 X / 共 Y 处"提示。
+   */
+  export function countMatches() {
+    if (!view) return 0;
+    const query = getSearchQuery(view.state);
+    if (!query || !query.search) return 0;
+    const cursor = query.getCursor(view.state.doc);
+    let count = 0;
+    let guard = 0;
+    while (!cursor.next().done && guard < 200000) {
+      count++;
+      guard++;
+    }
+    return count;
+  }
+
+  export function focusEditor() {
+    if (view) view.focus();
   }
 
   export function getEditorValue() {

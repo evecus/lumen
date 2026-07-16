@@ -36,7 +36,7 @@
 
   <button
     class="tb-btn"
-    title="查找 / 替换 (Ctrl+F / Ctrl+H，需先点击编辑区)"
+    title="查找 / 替换 (Ctrl+F / Ctrl+H)"
     on:click={() => dispatch("open-search")}
   >
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" /></svg>

@@ -73,14 +73,19 @@ npm run tauri dev
 
 2. **触发构建的两种方式：**
 
-   - **只想要构建产物、不发正式 Release**：直接推送到 `main` 分支，或者去 GitHub 仓库的 Actions 页面手动点击 "Run workflow"。构建完成后，在该次 workflow run 的页面底部 "Artifacts" 里下载 `lumen-windows-installer`，里面是生成的 `.exe` 安装包。
+   - **只想要构建产物、不发正式 Release**：直接推送到 `main` 分支。构建完成后，在该次 workflow run 的页面底部 "Artifacts" 里下载 `lumen-windows-installer`，里面是生成的 `.exe` 安装包（这种方式不会创建 Release，也不会改动版本号文件）。
 
-   - **想要发布一个正式版本（推荐）**：打一个 tag 再推送，例如：
-     ```bash
-     git tag v0.1.0
-     git push origin v0.1.0
-     ```
-     这会触发构建，并自动在仓库的 Releases 里创建一个**草稿** Release，把编译好的 `.exe` 安装包作为附件传上去。你可以去 GitHub 仓库的 "Releases" 页面，检查一下草稿内容，确认无误后点击 "Publish release" 正式发布。
+   - **想要发布一个正式版本（推荐）**：去 GitHub 仓库的 **Actions** 页面 → 选中 "构建 Windows 安装包" 这个 workflow → 点击右侧的 "Run workflow" → 在弹出的 `tag` 输入框里填版本号，格式必须是 `v` 开头 + 三段式数字，例如 `v0.1.0` → 点击绿色的 "Run workflow" 按钮触发。
+
+     这次运行会自动完成以下几件事：
+     1. 校验你填的 tag 格式对不对（不对会直接报错终止，不会跑到编译那一步浪费时间）
+     2. 把 `v0.1.0` 去掉开头的 `v`，得到纯版本号 `0.1.0`
+     3. 把这个纯版本号同时写入 `src-tauri/Cargo.toml` 的 `version` 字段和 `src-tauri/tauri.conf.json` 的 `version` 字段（这两处都要改，才能保证编译出来的安装包文件属性里的版本号和你填的 tag 一致）
+     4. 编译，并用 `v0.1.0` 这个 tag 在仓库的 Releases 里创建一个**草稿** Release，把编译好的 `.exe` 安装包作为附件传上去
+
+     你可以去 GitHub 仓库的 "Releases" 页面，检查一下草稿内容，确认无误后点击 "Publish release" 正式发布。
+
+     注意：这个流程只会在触发这次 workflow 的运行环境里临时修改版本号文件用于编译，不会自动提交/推送这次版本号改动到你的仓库；如果想让仓库里的 `Cargo.toml` / `tauri.conf.json` 也永久保留这个版本号，需要你自己手动改一下再提交。
 
 3. 编译时间：GitHub 提供的 Windows runner 上，Rust 是从源码编译的，第一次大概需要 8-15 分钟（后续因为有 `rust-cache`，会明显加快）。
 
