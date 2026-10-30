@@ -1,0 +1,26 @@
+[package]
+name = "lumen"
+version = "0.1.0"
+edition = "2021"
+description = "Lumen 文本编辑器 — Rust + GPUI 重写版"
+authors = ["you"]
+default-run = "lumen"
+
+[dependencies]
+gpui = "0.2.2"
+ropey = "1.6"
+encoding_rs = "0.8"
+chardetng = "0.1"
+anyhow = "1"
+regex = "1"
+smol = "2"
+
+# 文件关联（仅 Windows 构建才会真正拉取并编译；Linux 等平台不会下载）
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+# gpui 0.2.2 的传递依赖 zed-async-tar -> xattr 0.2.3 在较新 libc（Rust 1.9x）下
+# 因 Linux 不再暴露 `ENOATTR` 而编译失败。这里用本地补丁版 xattr 替换：
+# Linux 上 ENOATTR 等价于 ENODATA，其余平台沿用 libc::ENOATTR。
+[patch.crates-io]
+xattr = { path = "patches/xattr-0.2.3" }
