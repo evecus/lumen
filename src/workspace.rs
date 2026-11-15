@@ -1131,9 +1131,13 @@ impl Render for Workspace {
         });
 
         div()
+            // GPUI 的 Div 默认 display:Block；flex_col()/flex_1() 只有在显式
+            // .flex()（display:Flex）之后才生效。漏掉会让整页按内容高度堆叠，
+            // 编辑区塌成 0 高、状态栏跑到窗口中间，下方留一大片空白。
+            .flex()
+            .flex_col()
             .size_full()
             .bg(BG_APP)
-            .flex_col()
             .track_focus(&focus_handle)
             .on_key_down(cx.listener(|view, event, window, cx| {
                 view.handle_key(event, window, cx);
@@ -1151,6 +1155,8 @@ impl Render for Workspace {
                     None
                 };
                 let editor = div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .relative()
                     .on_mouse_down(MouseButton::Left, cx.listener(|view, event, window, cx| {
@@ -1180,12 +1186,15 @@ impl Render for Workspace {
                         .size_full()
                     });
                 div()
-                    .flex_1()
+                    .flex()
                     .flex_row()
+                    .flex_1()
                     .min_h(px(0.0))
                     .when_some(sidebar, |row, sb| row.child(sb))
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
                             .relative()
                             .child(editor)
@@ -1671,6 +1680,7 @@ fn title_bar(active: Option<&Tab>) -> Div {
     };
     div()
         .h(px(36.0))
+        .flex_shrink_0()
         .bg(BG_PANEL)
         .border_b_1()
         .border_color(BORDER)
@@ -1693,6 +1703,7 @@ fn toolbar(sidebar_visible: bool, has_active: bool, entity: &Entity<Workspace>) 
     let entity_n = entity.clone();
     div()
         .h(px(44.0))
+        .flex_shrink_0()
         .bg(BG_APP)
         .border_b_1()
         .border_color(BORDER)
@@ -1746,7 +1757,7 @@ fn tool_button(
 
 fn sidebar(tabs: &[(usize, String, bool, bool)], active_idx: Option<usize>, entity: &Entity<Workspace>) -> Div {
     let entity = entity.clone();
-    let mut list = div().flex_1().p(px(6.0));
+    let mut list = div().flex().flex_col().flex_1().p(px(6.0));
     for (idx, name, dirty, saved) in tabs {
         let idx = *idx;
         let name = name.clone();
@@ -1794,6 +1805,7 @@ fn sidebar(tabs: &[(usize, String, bool, bool)], active_idx: Option<usize>, enti
         .bg(BG_PANEL)
         .border_r_1()
         .border_color(BORDER)
+        .flex()
         .flex_col()
         .child(
             div()
@@ -1835,6 +1847,7 @@ fn status_bar(status: Option<(String, String, usize, usize, String)>) -> Div {
     match status {
         Some((enc, eol, chars, lines, path)) => div()
             .h(px(26.0))
+            .flex_shrink_0()
             .bg(ACCENT)
             .text_color(white())
             .flex()
@@ -1848,6 +1861,7 @@ fn status_bar(status: Option<(String, String, usize, usize, String)>) -> Div {
             .child(div().child(path)),
         None => div()
             .h(px(26.0))
+            .flex_shrink_0()
             .bg(ACCENT)
             .text_color(white())
             .flex()
@@ -2097,6 +2111,7 @@ fn search_panel(ws: &Workspace, entity: &Entity<Workspace>) -> Div {
         .child(
             div()
                 .mt(px(10.0))
+                .flex()
                 .flex_col()
                 .gap(px(6.0))
                 .child(checkbox(
@@ -2139,6 +2154,7 @@ fn search_panel(ws: &Workspace, entity: &Entity<Workspace>) -> Div {
         .child(
             div()
                 .mt(px(10.0))
+                .flex()
                 .flex_col()
                 .gap(px(6.0))
                 .child(div().text_size(px(10.5)).text_color(INK_FAINT).child("查找模式"))
@@ -2229,7 +2245,7 @@ fn new_file_dialog(nf: &NewFileDialog, entity: &Entity<Workspace>) -> Div {
             e_bg.update(cx, |ws, _cx| ws.new_file = None);
         });
 
-    let mut encoding_rows = div().flex_col().gap(px(4.0));
+    let mut encoding_rows = div().flex().flex_col().gap(px(4.0));
     for (idx, (code, desc)) in ENCODING_OPTIONS.iter().enumerate() {
         let selected = idx == nf.encoding;
         let e = e_enc[idx].clone();
@@ -2262,6 +2278,7 @@ fn new_file_dialog(nf: &NewFileDialog, entity: &Entity<Workspace>) -> Div {
                 )
                 .child(
                     div()
+                        .flex()
                         .flex_col()
                         .child(div().text_size(px(12.0)).text_color(INK).child(*code))
                         .child(div().text_size(px(10.5)).text_color(INK_FAINT).child(*desc)),
@@ -2346,7 +2363,7 @@ fn file_dialog_view(dlg: &FileDialog, entity: &Entity<Workspace>) -> Div {
     let e_entries: Vec<Entity<Workspace>> = dlg.entries.iter().map(|_| entity.clone()).collect();
 
 
-    let mut rows = div().flex_col().gap(px(2.0));
+    let mut rows = div().flex().flex_col().gap(px(2.0));
     // 上级目录
     let eu = e_up.clone();
     rows = rows.child(
@@ -2406,6 +2423,7 @@ fn file_dialog_view(dlg: &FileDialog, entity: &Entity<Workspace>) -> Div {
                 .border_color(BORDER_STRONG)
                 .rounded(px(8.0))
                 .shadow_lg()
+                .flex()
                 .flex_col()
                 .p(px(16.0))
                 .text_color(INK)
