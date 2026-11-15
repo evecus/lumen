@@ -1219,6 +1219,21 @@ impl Workspace {
         // 文件对话框 / 新建 / 查找输入优先
         match self.input_focus {
             InputFocus::NewFileName => {
+                // 对话框里的 Enter / Escape 同样要按 GPUI 小写按键名匹配，
+                // 否则会被 edit_text_field 当成普通字符追加到文件名后面。
+                match event.keystroke.key.to_ascii_lowercase().as_str() {
+                    "enter" => {
+                        self.confirm_new_file(cx);
+                        return;
+                    }
+                    "escape" => {
+                        self.new_file = None;
+                        self.input_focus = InputFocus::None;
+                        cx.notify();
+                        return;
+                    }
+                    _ => {}
+                }
                 if let Some(dlg) = self.new_file.as_mut() {
                     edit_text_field(&mut dlg.name, event);
                     cx.notify();
@@ -1226,6 +1241,19 @@ impl Workspace {
                 return;
             }
             InputFocus::SaveFileName => {
+                match event.keystroke.key.to_ascii_lowercase().as_str() {
+                    "enter" => {
+                        self.confirm_file_dialog(cx);
+                        return;
+                    }
+                    "escape" => {
+                        self.file_dialog = None;
+                        self.input_focus = InputFocus::None;
+                        cx.notify();
+                        return;
+                    }
+                    _ => {}
+                }
                 if let Some(dlg) = self.file_dialog.as_mut() {
                     edit_text_field(&mut dlg.filename, event);
                     cx.notify();
@@ -1233,16 +1261,17 @@ impl Workspace {
                 return;
             }
             InputFocus::SearchFind => {
-                match event.keystroke.key.as_str() {
-                    "Enter" => {
+                let key = event.keystroke.key.to_ascii_lowercase();
+                match key.as_str() {
+                    "enter" => {
                         if event.keystroke.modifiers.shift {
                             self.find_prev(cx);
                         } else {
                             self.find_next(cx);
                         }
                     }
-                    "Escape" => self.close_search(cx),
-                    "F3" => {
+                    "escape" => self.close_search(cx),
+                    "f3" => {
                         if event.keystroke.modifiers.shift {
                             self.find_prev(cx);
                         } else {
@@ -1258,9 +1287,17 @@ impl Workspace {
                 return;
             }
             InputFocus::SearchReplace => {
-                match event.keystroke.key.as_str() {
-                    "Enter" => self.replace_current(cx),
-                    "Escape" => self.close_search(cx),
+                let key = event.keystroke.key.to_ascii_lowercase();
+                match key.as_str() {
+                    "enter" => self.replace_current(cx),
+                    "escape" => self.close_search(cx),
+                    "f3" => {
+                        if event.keystroke.modifiers.shift {
+                            self.find_prev(cx);
+                        } else {
+                            self.find_next(cx);
+                        }
+                    }
                     _ => {
                         edit_text_field(&mut self.search.replace, event);
                         cx.notify();
@@ -1273,11 +1310,16 @@ impl Workspace {
 
         let mods = &event.keystroke.modifiers;
         let ctrl = mods.control || mods.platform;
-        let key = event.keystroke.key.clone();
+        // GPUI 的 `Keystroke.key` 一律是小写具名键（"enter" / "backspace" /
+        // "space" / "up" / "pageup" / "f3" …），与浏览器 KeyboardEvent.key 的
+        // "Enter" / "Backspace" / "ArrowUp" 命名不同。早期代码按浏览器命名
+        // 匹配，全部落空后把按键名当文本插入，于是按 Enter 会打出 "enter"、
+        // 按退格会打出 "backspace"。这里统一归一化后再匹配。
+        let key = event.keystroke.key.to_ascii_lowercase();
 
         if ctrl {
             let shift = mods.shift;
-            match key.to_lowercase().as_str() {
+            match key.as_str() {
                 "n" => {
                     self.open_new_file_dialog(cx);
                     return;
@@ -1306,7 +1348,14 @@ impl Workspace {
                 "c" => self.copy_selection(cx),
                 "x" => self.cut_selection(cx),
                 "v" => self.paste(cx),
-                "z" => self.undo(cx),
+                // Ctrl+Shift+Z 与 Ctrl+Y 都是重做，对齐常见编辑器习惯。
+                "z" => {
+                    if shift {
+                        self.redo(cx);
+                    } else {
+                        self.undo(cx);
+                    }
+                }
                 "y" => self.redo(cx),
                 _ => {}
             }
@@ -1314,14 +1363,14 @@ impl Workspace {
         }
 
         match key.as_str() {
-            "F3" => {
+            "f3" => {
                 if mods.shift {
                     self.find_prev(cx);
                 } else {
                     self.find_next(cx);
                 }
             }
-            "Escape" => {
+            "escape" => {
                 if self.search.visible {
                     self.close_search(cx);
                 } else if let Some(tab) = self.active_tab_mut() {
@@ -1329,27 +1378,27 @@ impl Workspace {
                     cx.notify();
                 }
             }
-            "Backspace" => self.backspace(cx),
-            "Delete" => self.delete_forward(cx),
-            "Enter" => self.insert_text_at_cursor("\n", cx),
-            "Tab" => self.insert_text_at_cursor("\t", cx),
-            "ArrowLeft" => self.move_cursor(-1, mods, cx),
-            "ArrowRight" => self.move_cursor(1, mods, cx),
-            "ArrowUp" => self.move_vertical(-1, mods, window, cx),
-            "ArrowDown" => self.move_vertical(1, mods, window, cx),
-            "Home" => self.cursor_line_start(cx),
-            "End" => self.cursor_line_end(cx),
-            "PageUp" => self.move_page(-1, mods, window, cx),
-            "PageDown" => self.move_page(1, mods, window, cx),
-            " " => self.insert_text_at_cursor(" ", cx),
+            "backspace" => self.backspace(cx),
+            "delete" => self.delete_forward(cx),
+            "enter" => self.insert_text_at_cursor("\n", cx),
+            "tab" => self.insert_text_at_cursor("\t", cx),
+            "space" => self.insert_text_at_cursor(" ", cx),
+            "left" => self.move_cursor(-1, mods, cx),
+            "right" => self.move_cursor(1, mods, cx),
+            "up" => self.move_vertical(-1, mods, window, cx),
+            "down" => self.move_vertical(1, mods, window, cx),
+            "home" => self.cursor_line_start(cx),
+            "end" => self.cursor_line_end(cx),
+            "pageup" => self.move_page(-1, mods, window, cx),
+            "pagedown" => self.move_page(1, mods, window, cx),
             _ => {
-                let ch = if key.is_empty() {
-                    event.keystroke.key_char.clone().unwrap_or_default()
-                } else {
-                    key
-                };
-                if !ch.is_empty() && !mods.alt {
-                    self.insert_text_at_cursor(&ch, cx);
+                // 只把真正"可输入的字符"写进缓冲区。具名功能键（F1~F12、
+                // Insert、Menu、Win 等）在这里一律被 typed_char 过滤掉，
+                // 不会再出现"按功能键打出一串字母"的问题。
+                if !mods.alt {
+                    if let Some(ch) = typed_char(event) {
+                        self.insert_text_at_cursor(&ch, cx);
+                    }
                 }
             }
         }
@@ -1641,23 +1690,50 @@ fn mk_run_bg(len: usize, color: Hsla, bg: Hsla) -> TextRun {
     }
 }
 
+/// 把一个按键转换成"应该插入到文本里的字符串"。
+///
+/// GPUI 的 `Keystroke.key` 是**按键名**（小写，例如 `enter`、`backspace`、
+/// `up`、`space`、`f3`），并不是可输入文本；`key_char` 才是平台解析出来的
+/// 实际字符（包含 Shift 产生的大写、非美式键盘布局的字符、IME 结果）。
+/// 特殊键的 `key_char` 恒为 `None`。因此这里只接受可打印字符，任何具名
+/// 功能键都返回 `None`，从根上防止按键名被当成正文写入。
+fn typed_char(event: &KeyDownEvent) -> Option<String> {
+    let ks = &event.keystroke;
+
+    // 空格键：GPUI 里 key = "space" 且 key_char = None，需要单独还原成空格。
+    if ks.key.eq_ignore_ascii_case("space") {
+        return Some(" ".to_string());
+    }
+    if let Some(ch) = ks.key_char.as_deref() {
+        return (!ch.is_empty() && !ch.chars().all(|c| c.is_control()))
+            .then(|| ch.to_string());
+    }
+    // 兜底：部分平台 / 模拟事件不带 key_char，此时只接受单个可打印字符，
+    // 杜绝把 "enter"、"backspace"、"f12" 这类按键名当成文本插入。
+    let mut chars = ks.key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if !c.is_control() => Some(c.to_string()),
+        _ => None,
+    }
+}
+
 fn edit_text_field(field: &mut String, event: &KeyDownEvent) {
-    let key = event.keystroke.key.clone();
+    let key = event.keystroke.key.to_ascii_lowercase();
     let mods = &event.keystroke.modifiers;
     let ctrl = mods.control || mods.platform;
     match key.as_str() {
-        "Backspace" => {
+        "backspace" => {
             field.pop();
         }
-        "Enter" => {}
-        "Escape" => {}
+        // 功能键不产生文本；Enter / Escape / F3 由上层焦点分支处理。
+        "enter" | "escape" | "f3" | "tab" | "delete" | "insert"
+        | "left" | "right" | "up" | "down" | "home" | "end"
+        | "pageup" | "pagedown" => {}
         _ => {
-            let ch = if key.is_empty() {
-                event.keystroke.key_char.clone().unwrap_or_default()
-            } else {
-                key
-            };
-            if !ch.is_empty() && !ctrl && !mods.alt {
+            if ctrl || mods.alt {
+                return;
+            }
+            if let Some(ch) = typed_char(event) {
                 field.push_str(&ch);
             }
         }
@@ -2565,4 +2641,91 @@ fn transparent() -> Hsla {
 
 fn white() -> Hsla {
     rgb(0xffffff).into()
+}
+
+#[cfg(test)]
+mod key_input_tests {
+    // 不能用 `use super::*`：`super` 通过 `use gpui::*` 引入了
+    // `gpui::test` 属性宏，会遮蔽内置的 `#[test]` 并导致宏递归展开。
+    use super::{edit_text_field, typed_char};
+    use gpui::{KeyDownEvent, Keystroke, Modifiers};
+
+    /// 构造真实运行时的按键事件：GPUI 对特殊键的 `key_char` 恒为 `None`。
+    fn key_event(key: &str, key_char: Option<&str>) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers::none(),
+                key: key.to_string(),
+                key_char: key_char.map(String::from),
+            },
+            is_held: false,
+        }
+    }
+
+    /// `handle_key` 主分支使用的按键名，必须保持 GPUI 的小写命名。
+    const HANDLED_KEYS: &[&str] = &[
+        "f3", "escape", "backspace", "delete", "enter", "tab", "space", "left", "right", "up",
+        "down", "home", "end", "pageup", "pagedown",
+    ];
+
+    #[test]
+    fn handled_keys_are_lowercase_gpui_names() {
+        for k in HANDLED_KEYS {
+            assert_eq!(k.to_ascii_lowercase(), *k, "{k} 不是 GPUI 的小写按键名");
+        }
+    }
+
+    #[test]
+    fn every_gpui_named_key_is_handled_or_filtered() {
+        // 取自 gpui 0.2.2 platform/windows/events.rs::parse_immutable 的具名键。
+        let named = [
+            "space", "backspace", "enter", "tab", "up", "down", "right", "left", "home", "end",
+            "pageup", "pagedown", "back", "forward", "escape", "insert", "delete", "menu", "f1",
+            "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+        ];
+        for k in named {
+            let e = key_event(k, None);
+            let normalized = e.keystroke.key.to_ascii_lowercase();
+            if HANDLED_KEYS.contains(&normalized.as_str()) {
+                continue; // 由 handle_key 显式处理
+            }
+            assert_eq!(
+                typed_char(&e),
+                None,
+                "{k} 未被显式处理却会产生文本，按键名会被写进正文"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_char_returns_only_real_text() {
+        assert_eq!(typed_char(&key_event("space", None)), Some(" ".into()));
+        assert_eq!(typed_char(&key_event("a", None)), Some("a".into()));
+        assert_eq!(typed_char(&key_event("中", None)), Some("中".into()));
+        // key_char 优先：Shift 大写与 IME 结果
+        assert_eq!(typed_char(&key_event("a", Some("A"))), Some("A".into()));
+        assert_eq!(typed_char(&key_event("a", Some("你好"))), Some("你好".into()));
+        // 控制字符、空串与未匹配的功能键都不进正文
+        assert_eq!(typed_char(&key_event("a", Some("\n"))), None);
+        assert_eq!(typed_char(&key_event("a", Some(""))), None);
+        assert_eq!(typed_char(&key_event("f12", None)), None);
+    }
+
+    #[test]
+    fn edit_text_field_uses_gpui_key_names() {
+        let mut s = String::from("abc");
+        edit_text_field(&mut s, &key_event("backspace", None));
+        assert_eq!(s, "ab");
+
+        // 功能键不再把 "enter" / "escape" 等按键名写进输入框
+        for k in ["enter", "escape", "f3", "tab", "delete", "up", "home"] {
+            edit_text_field(&mut s, &key_event(k, None));
+        }
+        assert_eq!(s, "ab");
+
+        edit_text_field(&mut s, &key_event("a", Some("A")));
+        assert_eq!(s, "abA");
+        edit_text_field(&mut s, &key_event("space", None));
+        assert_eq!(s, "abA ");
+    }
 }
