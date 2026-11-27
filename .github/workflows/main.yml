@@ -44,8 +44,8 @@ jobs:
 
       - name: Show toolchain
         run: |
-          rustc -vV
-          cargo -V
+          cargo update 
+
 
       # --locked：严格使用仓库里的 Cargo.lock，避免 CI 上意外升级依赖。
       # 新增了 two-face 依赖：本地先 `cargo build` 一次并提交更新后的 Cargo.lock，
