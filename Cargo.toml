@@ -1,0 +1,34 @@
+[package]
+name = "lumen"
+version = "0.1.0"
+edition = "2021"
+description = "Lumen 文本编辑器 — Rust + GPUI 重写版"
+authors = ["you"]
+default-run = "lumen"
+build = "build.rs"
+
+[dependencies]
+gpui = "0.2.2"
+ropey = "1.6"
+encoding_rs = "0.8"
+chardetng = "0.1"
+anyhow = "1"
+regex = "1"
+smol = "2"
+# 语法高亮：two-face 提供 bat 整理的 ~190 种语法与配色，并重新导出 syntect。
+# 用 syntect-fancy（纯 Rust 正则 fancy-regex），不需要编译 Oniguruma C 库。
+two-face = { version = "0.4.3", default-features = false, features = ["syntect-fancy"] }
+
+# 文件关联（仅 Windows 构建才会真正拉取并编译；Linux 等平台不会下载）
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+# 构建脚本：Windows 上嵌入应用图标。
+[build-dependencies]
+embed-resource = "3"
+
+# gpui 0.2.2 的传递依赖 zed-async-tar -> xattr 0.2.3 在较新 libc（Rust 1.9x）下
+# 因 Linux 不再暴露 `ENOATTR` 而编译失败。这里用本地补丁版 xattr 替换：
+# Linux 上 ENOATTR 等价于 ENODATA，其余平台沿用 libc::ENOATTR。
+[patch.crates-io]
+xattr = { path = "patches/xattr-0.2.3" }

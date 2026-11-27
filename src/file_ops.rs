@@ -1,0 +1,185 @@
+//! 文件读写与编码处理。
+//!
+//! 移植自原 Tauri 版 `src-tauri/src/file_ops.rs`，逻辑保持一致：
+//! - 打开前做二进制嗅探，拒绝以文本方式打开二进制文件；
+//! - 编码嗅探（BOM → UTF-8 / UTF-16 → 严格 UTF-8 → chardetng 猜测）；
+//! - 记录原始换行符风格（CRLF / CR / LF），保存时原样写回；
+//! - 非 UTF-8 编码保存时若有字符无法表示，返回 `had_unmappable_chars` 让上层提示。
+
+use encoding_rs::Encoding;
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone)]
+pub struct FileReadResult {
+    pub content: String,
+    pub encoding: String,
+    pub eol: String,
+    pub is_binary: bool,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FileMeta {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteResult {
+    /// 保存过程中是否有字符无法用目标编码表示（会被替换为 ?）。
+    /// 这种情况下文件仍然被写入了，只是内容有损，上层据此提示用户。
+    pub had_unmappable_chars: bool,
+}
+
+/// 粗略判断一段字节是否为二进制内容：
+/// 如果前 8000 字节里出现 NUL 字节，或者不可打印控制字符比例过高，视为二进制。
+pub fn looks_binary(bytes: &[u8]) -> bool {
+    let sample_len = bytes.len().min(8000);
+    let sample = &bytes[..sample_len];
+    if sample.iter().any(|&b| b == 0) {
+        return true;
+    }
+    if sample.is_empty() {
+        return false;
+    }
+    let control_count = sample
+        .iter()
+        .filter(|&&b| b < 9 || (b > 13 && b < 32))
+        .count();
+    (control_count as f64) / (sample.len() as f64) > 0.05
+}
+
+pub fn detect_eol(text: &str) -> String {
+    if text.contains("\r\n") {
+        "CRLF".to_string()
+    } else if text.contains('\r') {
+        "CR".to_string()
+    } else {
+        "LF".to_string()
+    }
+}
+
+/// 使用 chardetng 做编码嗅探，再用 encoding_rs 解码为 UTF-8 字符串。
+pub fn decode_bytes(bytes: &[u8]) -> (String, String) {
+    // 优先检测 BOM
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        let (text, _, _) = encoding_rs::UTF_8.decode(&bytes[3..]);
+        return (text.into_owned(), "UTF-8 (BOM)".to_string());
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let (text, _, _) = encoding_rs::UTF_16LE.decode(&bytes[2..]);
+        return (text.into_owned(), "UTF-16 LE".to_string());
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let (text, _, _) = encoding_rs::UTF_16BE.decode(&bytes[2..]);
+        return (text.into_owned(), "UTF-16 BE".to_string());
+    }
+
+    // 尝试严格 UTF-8
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return (s.to_string(), "UTF-8".to_string());
+    }
+
+    // 用 chardetng 猜测编码（常见于 GBK/GB18030 等中文文件）
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(bytes, true);
+    let guessed: &'static Encoding = detector.guess(None, true);
+    let (text, _, _) = guessed.decode(bytes);
+    (text.into_owned(), guessed.name().to_string())
+}
+
+pub fn read_text_file(path: &str) -> Result<FileReadResult, String> {
+    let bytes = fs::read(path).map_err(|e| format!("读取文件失败: {}", e))?;
+
+    if looks_binary(&bytes) {
+        return Ok(FileReadResult {
+            content: String::new(),
+            encoding: "binary".to_string(),
+            eol: "LF".to_string(),
+            is_binary: true,
+        });
+    }
+
+    let (content, encoding) = decode_bytes(&bytes);
+    let eol = detect_eol(&content);
+
+    Ok(FileReadResult {
+        content,
+        encoding,
+        eol,
+        is_binary: false,
+    })
+}
+
+/// 根据编码名字符串找到对应的 encoding_rs::Encoding。
+/// 支持常见的别名写法（不区分大小写），找不到时默认回退到 UTF-8。
+fn resolve_encoding(name: &str) -> &'static Encoding {
+    let normalized = name.trim().to_uppercase().replace('_', "-");
+    match normalized.as_str() {
+        "UTF-8" | "UTF8" | "UTF-8 (BOM)" => encoding_rs::UTF_8,
+        "GBK" | "GB2312" | "CP936" => encoding_rs::GBK,
+        "GB18030" => encoding_rs::GB18030,
+        "BIG5" | "BIG-5" => encoding_rs::BIG5,
+        "UTF-16LE" | "UTF-16 LE" => encoding_rs::UTF_16LE,
+        "UTF-16BE" | "UTF-16 BE" => encoding_rs::UTF_16BE,
+        "SHIFT-JIS" | "SHIFT_JIS" | "SJIS" => encoding_rs::SHIFT_JIS,
+        "EUC-KR" => encoding_rs::EUC_KR,
+        "ISO-8859-1" | "LATIN1" | "WINDOWS-1252" => encoding_rs::WINDOWS_1252,
+        _ => encoding_rs::UTF_8,
+    }
+}
+
+pub fn normalize_eol(text: &str, eol: &str) -> String {
+    // 先统一成 \n，再按目标格式转换，避免混合换行叠加
+    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
+    match eol {
+        "CRLF" => unified.replace('\n', "\r\n"),
+        "CR" => unified.replace('\n', "\r"),
+        _ => unified,
+    }
+}
+
+pub fn write_text_file(
+    path: &str,
+    content: &str,
+    eol: &str,
+    encoding: Option<&str>,
+) -> Result<WriteResult, String> {
+    let normalized = normalize_eol(content, eol);
+    let enc = resolve_encoding(encoding.unwrap_or("UTF-8"));
+
+    if enc == encoding_rs::UTF_8 {
+        // UTF-8 直接写字节，避免不必要的编码往返
+        fs::write(path, normalized).map_err(|e| format!("保存文件失败: {}", e))?;
+        Ok(WriteResult {
+            had_unmappable_chars: false,
+        })
+    } else {
+        // 非 UTF-8 编码（例如 GBK）：把字符串编码成目标字节序列再写入。
+        // 编码过程中遇到目标编码无法表示的字符会被替换为 '?'，
+        // 这是 encoding_rs 的标准行为；文件仍然会被正常写入，
+        // 只是把"有损"这件事通过返回值告诉上层。
+        let (bytes, _, had_unmappable) = enc.encode(&normalized);
+        fs::write(path, bytes.as_ref()).map_err(|e| format!("保存文件失败: {}", e))?;
+        Ok(WriteResult {
+            had_unmappable_chars: had_unmappable,
+        })
+    }
+}
+
+#[allow(dead_code)]
+pub fn get_file_meta(path: &str) -> Result<FileMeta, String> {
+    let p = Path::new(path);
+    let meta = fs::metadata(path).map_err(|e| format!("无法获取文件信息: {}", e))?;
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    Ok(FileMeta {
+        name,
+        path: path.to_string(),
+        size: meta.len(),
+    })
+}
