@@ -26,6 +26,8 @@ pub struct Buffer {
     dirty: bool,
     undo: Vec<Edit>,
     redo: Vec<Edit>,
+    /// 每次内容变化 +1，供布局缓存判断是否需要重算。
+    version: u64,
 }
 
 impl Buffer {
@@ -37,7 +39,13 @@ impl Buffer {
             dirty: false,
             undo: Vec::new(),
             redo: Vec::new(),
+            version: 0,
         }
+    }
+
+    /// 内容版本号：任何修改都会让它变化。
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// 标记为已保存：把当前内容记为「干净」基准，并清空重做栈。
@@ -53,6 +61,7 @@ impl Buffer {
 
     /// 整段替换内容（用于"全部替换"后写回）。会清空撤销/重做栈。
     pub fn set_text(&mut self, text: &str) {
+        self.version += 1;
         self.rope = Rope::from_str(text);
         self.saved = self.rope.to_string();
         self.dirty = false;
@@ -162,6 +171,7 @@ impl Buffer {
             self.rope.insert(start, text);
         }
         self.dirty = true;
+        self.version += 1;
         start + text.chars().count()
     }
 
@@ -174,6 +184,7 @@ impl Buffer {
         }
         let new_chars = text.chars().count();
         self.rope.insert(pos, text);
+        self.version += 1;
         self.push_insert_edit(pos, text);
         self.dirty = true;
         self.redo.clear();
@@ -188,6 +199,7 @@ impl Buffer {
         }
         let removed: String = self.rope.slice(start..end).chars().collect();
         self.rope.remove(start..end);
+        self.version += 1;
         self.undo.push(Edit {
             start,
             old: removed,
@@ -205,6 +217,12 @@ impl Buffer {
     pub fn replace(&mut self, range: Range<usize>, text: &str) -> usize {
         let start = range.start.min(self.rope.len_chars());
         let end = range.end.min(self.rope.len_chars());
+        // 空区间就是纯插入。旧代码会走到下面的 pop：把「上一次」无关的撤销记录
+        // 弹出来改写，撤销时就会还原出错误的内容。
+        if start >= end {
+            return self.insert(start, text);
+        }
+        self.version += 1;
         if start < end {
             let removed: String = self.rope.slice(start..end).chars().collect();
             self.rope.remove(start..end);
@@ -259,7 +277,17 @@ impl Buffer {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.undo_pos().is_some()
+    }
+
+    pub fn redo(&mut self) -> bool {
+        self.redo_pos().is_some()
+    }
+
+    /// 撤销一步，返回撤销后光标应在的位置（被还原文本的末尾）。
+    pub fn undo_pos(&mut self) -> Option<usize> {
         if let Some(edit) = self.undo.pop() {
+            self.version += 1;
             let new_start = edit.start;
             let new_end = edit.start + edit.new.chars().count();
             if new_end > new_start {
@@ -268,16 +296,19 @@ impl Buffer {
             if !edit.old.is_empty() {
                 self.rope.insert(new_start, &edit.old);
             }
+            let pos = new_start + edit.old.chars().count();
             self.redo.push(edit);
             self.recompute_dirty();
-            true
+            Some(pos)
         } else {
-            false
+            None
         }
     }
 
-    pub fn redo(&mut self) -> bool {
+    /// 重做一步，返回重做后光标应在的位置（重新插入文本的末尾）。
+    pub fn redo_pos(&mut self) -> Option<usize> {
         if let Some(edit) = self.redo.pop() {
+            self.version += 1;
             let old_start = edit.start;
             let old_end = edit.start + edit.old.chars().count();
             if old_end > old_start {
@@ -286,11 +317,12 @@ impl Buffer {
             if !edit.new.is_empty() {
                 self.rope.insert(old_start, &edit.new);
             }
+            let pos = old_start + edit.new.chars().count();
             self.undo.push(edit);
             self.recompute_dirty();
-            true
+            Some(pos)
         } else {
-            false
+            None
         }
     }
 

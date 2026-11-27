@@ -15,6 +15,14 @@
 //!
 //! 打开 / 另存为使用系统原生文件对话框（`prompt_for_paths` / `prompt_for_new_path`）。
 //!
+//! 代码编辑能力分布在几个纯函数模块里（都有单元测试）：
+//! - `lang.rs`    按语言给出缩进类型、注释符号、自动配对规则；
+//! - `indent.rs`  回车 / Tab / 退格 / 闭合括号的缩进规则；
+//! - `editing.rs` 注释切换、括号匹配、单词查找、自动配对判断、Tab 展开。
+//!
+//! 排版：每个标签有 `LayoutCache`，只在内容或宽度变化时重算每行 y 起点；
+//! 绘制、命中测试都二分查找，只排版可见行。Tab 按 4 列制表位展开显示。
+//!
 //! 语法高亮见 `highlight.rs`：`line_runs` 把语法着色（前景）与选区 / 查找匹配（背景）
 //! 合并成 TextRun；只着色可见行，高亮状态按行增量缓存在每个标签的 `syntax` 里。
 
@@ -29,6 +37,11 @@ use crate::file_assoc;
 use crate::file_ops::read_text_file;
 use crate::file_ops::write_text_file;
 use crate::highlight::{Span, SyntaxCache};
+use crate::editing::{self, DispLine, PairAction};
+use crate::indent;
+use crate::lang::{self, LangSpec};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::cell::RefCell;
 use crate::search::{find_matches, replace_all, replace_one, SearchMode, SearchQuery};
 use crate::theme::*;
@@ -55,6 +68,7 @@ pub enum ToastKind {
 enum InputFocus {
     None,
     NewFileName,
+    GotoLine,
     SearchFind,
     SearchReplace,
 }
@@ -90,10 +104,91 @@ pub struct Tab {
     pub scroll: f32,
     /// 语法高亮缓存。绘制函数只拿到 `&self`，所以用 RefCell 做内部可变。
     pub syntax: RefCell<SyntaxCache>,
+    /// 自动换行（关闭时长行横向滚动，代码文件默认关闭）
+    pub wrap: bool,
+    /// 横向滚动量（只在不换行时有效）
+    pub scroll_x: f32,
+    /// 排版缓存：每行的 y 起点，避免每帧给整篇文档排版
+    pub layout: RefCell<LayoutCache>,
+}
+
+/// Tab 字符显示为几列。
+const TAB_W: usize = 4;
+
+/// 每个标签的排版缓存。
+///
+/// 旧实现每帧把**整篇文档**排版两遍（先算总高度，再逐行判断是否可见），光标移动、
+/// 命中测试也都要从第一行累加到当前行：文件一大，打字和滚动就明显卡顿。现在只在
+/// 内容变化（`Buffer::version`）或换行宽度变化时重算每行的 y 起点，绘制时二分查找
+/// 第一条可见行，只排版看得见的几十行。
+#[derive(Default)]
+pub struct LayoutCache {
+    valid: bool,
+    version: u64,
+    /// 0 = 不自动换行
+    wrap_px: f32,
+    /// tops[i] = 第 i 行顶部的 y（内容坐标）；长度 = 行数 + 1，最后一项是总高度
+    tops: Vec<f32>,
+    /// 自动换行时：行内容哈希 → 占几个视觉行。插入 / 删除行后其余行只是挪了位置，
+    /// 靠它直接复用，不用重新排版。
+    memo: HashMap<u64, u32>,
+    /// 不换行时最长行的字符数（用来算横向滚动范围）
+    max_cols: usize,
+    /// 等宽字体单个字符宽度
+    char_w: f32,
+    /// 文件的缩进单位（Tab 或若干空格），随内容变化更新
+    unit: String,
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// tops 中 y 所在的行（二分查找）。
+fn line_at_y(tops: &[f32], y: f32) -> usize {
+    let n = tops.len().saturating_sub(1);
+    if n == 0 {
+        return 0;
+    }
+    tops[..n].partition_point(|&t| t <= y).saturating_sub(1).min(n - 1)
+}
+
+/// 纯文本、Markdown、日志默认自动换行；代码默认不换行（太大的文件也不换行）。
+fn default_wrap(name: &str, buffer: &Buffer) -> bool {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "" | "txt" | "text" | "md" | "markdown" | "log" | "rst" | "adoc")
+        && buffer.char_count() < 2_000_000
+}
+
+/// 缩进的显示宽度（Tab 按 TAB_W 计）。
+fn ws_width(s: &str) -> usize {
+    s.chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(|c| if c == '\t' { TAB_W } else { 1 })
+        .sum()
+}
+
+fn leading_ws(s: &str) -> &str {
+    let end = s.len() - s.trim_start_matches([' ', '\t']).len();
+    &s[..end]
+}
+
+/// 当前标签的语言规则（缩进、注释、自动配对）。
+fn tab_spec(tab: &Tab) -> LangSpec {
+    let mut syn = tab.syntax.borrow_mut();
+    syn.refresh(&tab.name, &tab.buffer);
+    lang::spec_for(syn.syntax_name(), &tab.name)
 }
 
 impl Tab {
     fn new(name: String, path: Option<String>, buffer: Buffer, encoding: String, eol: String) -> Self {
+        let wrap = default_wrap(&name, &buffer);
         Tab {
             id: 0,
             name,
@@ -105,6 +200,9 @@ impl Tab {
             anchor: 0,
             scroll: 0.0,
             syntax: RefCell::new(SyntaxCache::new()),
+            wrap,
+            scroll_x: 0.0,
+            layout: RefCell::new(LayoutCache::default()),
         }
     }
 
@@ -168,11 +266,15 @@ pub struct Workspace {
     new_file: Option<NewFileDialog>,
 
     input_focus: InputFocus,
-    /// 当前获得焦点的输入框（文件名 / 查找 / 替换）里的光标与选区锚点（字符索引）。
+    /// 「转到行」输入框的内容；None 表示没打开。
+    goto: Option<String>,
+    /// 下一帧把光标滚动到视口中间（查找跳转等拿不到 Window 的地方设置）。
+    reveal_cursor: bool,
+    /// 当前获得焦点的输入框（文件名 / 查找 / 替换 / 转到行）里的光标与选区锚点（字符索引）。
     field_cursor: usize,
     field_anchor: usize,
     /// 各输入框文字区域在窗口中的位置，用于鼠标点选定位和摆放输入法候选窗。
-    field_rects: [Bounds<Pixels>; 3],
+    field_rects: [Bounds<Pixels>; 4],
     drag_mode: DragMode,
 
     /// 输入法正在组合的文本区间（字符索引；编辑器时指缓冲区，输入框时指该输入框字符串）。
@@ -199,9 +301,11 @@ impl Workspace {
                 search: SearchPanel::default(),
                 new_file: None,
                 input_focus: InputFocus::None,
+                goto: None,
+                reveal_cursor: false,
                 field_cursor: 0,
                 field_anchor: 0,
-                field_rects: [Bounds::default(); 3],
+                field_rects: [Bounds::default(); 4],
                 drag_mode: DragMode::None,
                 marked: None,
                 context_menu: None,
@@ -581,6 +685,8 @@ impl Workspace {
             tab.cursor = e;
             tab.anchor = s;
         }
+        // 匹配项在视口外时滚过去（下一帧 prepaint 里执行）
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -657,6 +763,471 @@ impl Workspace {
         cx.notify();
     }
 
+    // ===== 自动缩进（规则在 indent.rs）=====
+
+    /// 把 [r.start, r.end) 替换成 text（作为一次可撤销的编辑），返回替换后文本的末尾。
+    fn replace_range(&mut self, r: Range<usize>, text: &str) -> Option<usize> {
+        let tab = self.active_tab_mut()?;
+        Some(match (r.start < r.end, text.is_empty()) {
+            (true, true) => {
+                tab.buffer.remove(r.clone());
+                r.start
+            }
+            (true, false) => tab.buffer.replace(r, text),
+            (false, true) => r.start,
+            (false, false) => tab.buffer.insert(r.start, text),
+        })
+    }
+
+    /// 回车：保持上一行缩进；在 `{` `[` `(` 、Python/YAML 的 `:`、HTML 开始标签之后
+    /// 多缩进一级；在 `{|}` 之间回车展开成三行；Markdown 列表、块注释自动续写。
+    fn newline(&mut self, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab() else { return };
+        let spec = tab_spec(tab);
+        let unit = indent::indent_unit(&tab.buffer, &tab.name);
+        let (s0, e0) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
+
+        // 收尾行（end / else / fi / </div> / Python 的 else: …）还和上一行一样深时，
+        // 先把当前行退回一级，再按新缩进换行。
+        if s0 == e0 {
+            let line = tab.buffer.char_to_line(s0);
+            let content = tab.buffer.line_content(line);
+            if indent::is_dedent_line(&content, spec.kind) {
+                let cur = leading_ws(&content).to_string();
+                let prev = (0..line)
+                    .rev()
+                    .take(200)
+                    .map(|i| tab.buffer.line_content(i))
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| ws_width(&l))
+                    .unwrap_or(0);
+                if !cur.is_empty() && ws_width(&cur) >= prev {
+                    let ls = tab.buffer.line_to_char(line);
+                    let new_ind = indent::dedent_once(&cur, &unit);
+                    let removed = cur.chars().count() - new_ind.chars().count();
+                    let cur_len = cur.chars().count();
+                    self.replace_range(ls..ls + cur_len, &new_ind);
+                    if let Some(t) = self.active_tab_mut() {
+                        t.cursor = t.cursor.saturating_sub(removed).max(ls);
+                        t.anchor = t.cursor;
+                    }
+                }
+            }
+        }
+
+        let Some(tab) = self.active_tab() else { return };
+        let (s, e) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
+        let (before, after) = line_around(&tab.buffer, s, e);
+        let ed = indent::on_enter_kind(&before, &after, &unit, spec.kind);
+        let start = s - ed.back.min(s);
+        let end = (e + ed.fwd).min(tab.buffer.char_count());
+        self.marked = None;
+        self.replace_range(start..end, &ed.insert);
+        if let Some(tab) = self.active_tab_mut() {
+            tab.cursor = start + ed.caret;
+            tab.anchor = tab.cursor;
+        }
+        cx.notify();
+    }
+
+    /// Tab：没有跨行选区时插入到下一个缩进位置；选中多行时整块缩进。
+    /// Shift+Tab：当前行 / 选中的各行回退一级。
+    fn tab_key(&mut self, shift: bool, cx: &mut Context<Workspace>) {
+        self.shift_lines_cmd(shift, false, cx);
+    }
+
+    /// 缩进 / 反缩进选中的行。`force_block` 为真时（Ctrl+] / Ctrl+[）即使没有选区
+    /// 也缩进整行，而不是在光标处插入空格。
+    fn shift_lines_cmd(&mut self, shift: bool, force_block: bool, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab() else { return };
+        let buf = &tab.buffer;
+        let unit = indent::indent_unit(buf, &tab.name);
+        let (s, e) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
+        let l0 = buf.char_to_line(s);
+        let mut l1 = buf.char_to_line(e);
+        // 选区停在下一行行首时，那一行不算在内
+        if e > s && l1 > l0 && e == buf.line_to_char(l1) {
+            l1 -= 1;
+        }
+
+        if !shift && l0 == l1 && !force_block {
+            let col = s - buf.line_to_char(l0);
+            let ins = if unit == "\t" {
+                "\t".to_string()
+            } else {
+                let w = unit.len();
+                " ".repeat(w - col % w)
+            };
+            self.insert_text_at_cursor(&ins, cx);
+            return;
+        }
+
+        let start = buf.line_to_char(l0);
+        let end = buf.line_to_char(l1) + buf.line_content(l1).chars().count();
+        let old = buf.slice_string(start..end);
+        let new = indent::shift_lines(&old, &unit, !shift);
+        if new == old {
+            return;
+        }
+        let old_len = old.chars().count();
+        let new_len = new.chars().count();
+        let had_sel = s < e;
+        let cursor = tab.cursor;
+        self.replace_range(start..end, &new);
+        if let Some(tab) = self.active_tab_mut() {
+            if had_sel {
+                // 保持整块选中，便于连续按 Tab / Shift+Tab
+                tab.anchor = start;
+                tab.cursor = start + new_len;
+            } else if new_len >= old_len {
+                // 单行缩进：光标随文字右移
+                tab.cursor = cursor + (new_len - old_len);
+                tab.anchor = tab.cursor;
+            } else {
+                // 单行 Shift+Tab：光标随文字左移
+                let removed = old_len - new_len;
+                tab.cursor = cursor.saturating_sub(removed).max(start);
+                tab.anchor = tab.cursor;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 在只有空白的行首输入 `}` `]` `)`：先回退一级缩进再输入。返回要替换的范围。
+    fn closer_dedent_range(&self, text: &str) -> Option<Range<usize>> {
+        if self.input_focus != InputFocus::None || self.marked.is_some() {
+            return None;
+        }
+        if !matches!(text, "}" | "]" | ")") {
+            return None;
+        }
+        let tab = self.active_tab()?;
+        if tab.anchor != tab.cursor {
+            return None;
+        }
+        let (before, _) = line_around(&tab.buffer, tab.cursor, tab.cursor);
+        let k = indent::closer_dedent(&before, &indent::indent_unit(&tab.buffer, &tab.name));
+        (k > 0).then(|| tab.cursor - k..tab.cursor)
+    }
+
+    // ===== 代码编辑命令 =====
+
+    /// 选区覆盖的行范围 (首行, 末行)。选区停在下一行行首时，那一行不算。
+    fn selected_lines(tab: &Tab) -> (usize, usize) {
+        let buf = &tab.buffer;
+        let (s, e) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
+        let l0 = buf.char_to_line(s);
+        let mut l1 = buf.char_to_line(e);
+        if e > s && l1 > l0 && e == buf.line_to_char(l1) {
+            l1 -= 1;
+        }
+        (l0, l1)
+    }
+
+    /// 第 l 行内容的末尾（不含换行符）。
+    fn line_end(buf: &Buffer, l: usize) -> usize {
+        buf.line_to_char(l) + buf.line_content(l).chars().count()
+    }
+
+    /// Ctrl+/：切换行注释（语言没有行注释时用块注释）。
+    fn toggle_comment(&mut self, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab() else { return };
+        let spec = tab_spec(tab);
+        let Some(token) = spec.line_comment else {
+            self.toggle_block_comment(cx);
+            return;
+        };
+        let (l0, l1) = Self::selected_lines(tab);
+        let start = tab.buffer.line_to_char(l0);
+        let end = Self::line_end(&tab.buffer, l1);
+        let old = tab.buffer.slice_string(start..end);
+        let new = editing::toggle_line_comment(&old, token);
+        if new == old {
+            return;
+        }
+        let had_sel = tab.anchor != tab.cursor;
+        let delta = new.chars().count() as isize - old.chars().count() as isize;
+        let cursor = tab.cursor;
+        self.replace_range(start..end, &new);
+        if let Some(tab) = self.active_tab_mut() {
+            let new_end = start + new.chars().count();
+            if had_sel {
+                tab.anchor = start;
+                tab.cursor = new_end;
+            } else {
+                tab.cursor = (cursor as isize + delta).clamp(start as isize, new_end as isize) as usize;
+                tab.anchor = tab.cursor;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Shift+Alt+A：切换块注释（没有选区时作用于当前行）。
+    fn toggle_block_comment(&mut self, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab() else { return };
+        let spec = tab_spec(tab);
+        let Some((open, close)) = spec.block_comment else {
+            self.show_toast("当前语言没有块注释语法".to_string(), ToastKind::Info, cx);
+            return;
+        };
+        let (mut s, mut e) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
+        if s == e {
+            let l = tab.buffer.char_to_line(s);
+            let content = tab.buffer.line_content(l);
+            s = tab.buffer.line_to_char(l) + leading_ws(&content).chars().count();
+            e = Self::line_end(&tab.buffer, l);
+        }
+        let old = tab.buffer.slice_string(s..e);
+        let new = editing::toggle_block_comment(&old, open, close);
+        self.replace_range(s..e, &new);
+        if let Some(tab) = self.active_tab_mut() {
+            tab.anchor = s;
+            tab.cursor = s + new.chars().count();
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+K：删除选中的行。
+    fn delete_lines(&mut self, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab() else { return };
+        let (l0, l1) = Self::selected_lines(tab);
+        let n = tab.buffer.line_count();
+        let mut start = tab.buffer.line_to_char(l0);
+        let end = if l1 + 1 < n {
+            tab.buffer.line_to_char(l1 + 1)
+        } else {
+            tab.buffer.char_count()
+        };
+        // 删的是最后几行：连同前面的换行符一起删，不留空行
+        if l1 + 1 >= n && l0 > 0 {
+            start = Self::line_end(&tab.buffer, l0 - 1);
+        }
+        let col = tab.cursor - tab.buffer.line_to_char(tab.buffer.char_to_line(tab.cursor));
+        self.replace_range(start..end, "");
+        if let Some(tab) = self.active_tab_mut() {
+            let target = if l1 + 1 >= n && l0 > 0 { l0 - 1 } else { l0 };
+            let line = target.min(tab.buffer.line_count().saturating_sub(1));
+            let ls = tab.buffer.line_to_char(line);
+            let len = tab.buffer.line_content(line).chars().count();
+            tab.cursor = ls + col.min(len);
+            tab.anchor = tab.cursor;
+        }
+        cx.notify();
+    }
+
+    /// Shift+Alt+↑/↓、Ctrl+Shift+D：复制选中的行。
+    fn duplicate_lines(&mut self, down: bool, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab() else { return };
+        let (l0, l1) = Self::selected_lines(tab);
+        let start = tab.buffer.line_to_char(l0);
+        let end = Self::line_end(&tab.buffer, l1);
+        let block = tab.buffer.slice_string(start..end);
+        let len = block.chars().count() + 1;
+        let (cursor, anchor) = (tab.cursor, tab.anchor);
+        if down {
+            self.replace_range(end..end, &format!("\n{block}"));
+            if let Some(tab) = self.active_tab_mut() {
+                tab.cursor = cursor + len;
+                tab.anchor = anchor + len;
+            }
+        } else {
+            self.replace_range(start..start, &format!("{block}\n"));
+        }
+        cx.notify();
+    }
+
+    /// Alt+↑/↓：把选中的行整体上移 / 下移一行。
+    fn move_lines(&mut self, up: bool, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab() else { return };
+        let (l0, l1) = Self::selected_lines(tab);
+        let n = tab.buffer.line_count();
+        if (up && l0 == 0) || (!up && l1 + 1 >= n) {
+            return;
+        }
+        let bstart = tab.buffer.line_to_char(l0);
+        let block = tab.buffer.slice_string(bstart..Self::line_end(&tab.buffer, l1));
+        let (cursor, anchor) = (tab.cursor, tab.anchor);
+        if up {
+            let other = tab.buffer.line_content(l0 - 1);
+            let rstart = tab.buffer.line_to_char(l0 - 1);
+            let rend = Self::line_end(&tab.buffer, l1);
+            self.replace_range(rstart..rend, &format!("{block}\n{other}"));
+            if let Some(tab) = self.active_tab_mut() {
+                tab.cursor = rstart + (cursor - bstart);
+                tab.anchor = rstart + anchor.saturating_sub(bstart);
+            }
+        } else {
+            let other = tab.buffer.line_content(l1 + 1);
+            let rend = Self::line_end(&tab.buffer, l1 + 1);
+            self.replace_range(bstart..rend, &format!("{other}\n{block}"));
+            let shift = other.chars().count() + 1;
+            if let Some(tab) = self.active_tab_mut() {
+                tab.cursor = bstart + shift + (cursor - bstart);
+                tab.anchor = bstart + shift + anchor.saturating_sub(bstart);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+Enter / Ctrl+Shift+Enter：在下方 / 上方插入新行（不拆分当前行）。
+    fn insert_line(&mut self, below: bool, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab() else { return };
+        let line = tab.buffer.char_to_line(tab.cursor);
+        if below {
+            let end = Self::line_end(&tab.buffer, line);
+            if let Some(tab) = self.active_tab_mut() {
+                tab.cursor = end;
+                tab.anchor = end;
+            }
+            self.newline(cx);
+        } else {
+            let ls = tab.buffer.line_to_char(line);
+            let content = tab.buffer.line_content(line);
+            let ind = leading_ws(&content).to_string();
+            self.replace_range(ls..ls, &format!("{ind}\n"));
+            if let Some(tab) = self.active_tab_mut() {
+                tab.cursor = ls + ind.chars().count();
+                tab.anchor = tab.cursor;
+            }
+            cx.notify();
+        }
+    }
+
+    /// Ctrl+L：选中当前行（连续按向下扩展）。
+    fn select_line(&mut self, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab_mut() else { return };
+        let (s, e) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
+        let l0 = tab.buffer.char_to_line(s);
+        // 已经整行选中时，选区末尾在下一行行首，l1 就是下一行：再按一次会多选一行
+        let l1 = tab.buffer.char_to_line(e);
+        let n = tab.buffer.line_count();
+        tab.anchor = tab.buffer.line_to_char(l0);
+        tab.cursor = if l1 + 1 < n {
+            tab.buffer.line_to_char(l1 + 1)
+        } else {
+            tab.buffer.char_count()
+        };
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+\：跳到配对括号。
+    fn jump_to_bracket(&mut self, cx: &mut Context<Workspace>) {
+        let Some(tab) = self.active_tab() else { return };
+        let Some((a, b)) = self.bracket_pair(tab) else { return };
+        let target = if tab.cursor == a || tab.cursor == a + 1 { b } else { a };
+        if let Some(tab) = self.active_tab_mut() {
+            tab.cursor = target;
+            tab.anchor = target;
+        }
+        cx.notify();
+    }
+
+    /// Alt+Z：切换自动换行。
+    fn toggle_wrap(&mut self, cx: &mut Context<Workspace>) {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.wrap = !tab.wrap;
+            tab.scroll_x = 0.0;
+            let on = tab.wrap;
+            self.show_toast(
+                if on { "已开启自动换行" } else { "已关闭自动换行" }.to_string(),
+                ToastKind::Info,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+G：打开「转到行」。
+    fn open_goto(&mut self, cx: &mut Context<Workspace>) {
+        if self.active_tab().is_none() {
+            return;
+        }
+        self.goto = Some(String::new());
+        self.focus_field(InputFocus::GotoLine);
+        cx.notify();
+    }
+
+    fn close_goto(&mut self, cx: &mut Context<Workspace>) {
+        self.goto = None;
+        if self.input_focus == InputFocus::GotoLine {
+            self.input_focus = InputFocus::None;
+        }
+        cx.notify();
+    }
+
+    /// 输入「行」或「行:列」后回车跳转。
+    fn confirm_goto(&mut self, window: &Window, cx: &mut Context<Workspace>) {
+        let text = self.goto.clone().unwrap_or_default();
+        let mut parts = text.trim().splitn(2, [':', '：', ',', '，', ' ']);
+        let line: Option<usize> = parts.next().and_then(|v| v.trim().parse().ok());
+        let col: usize = parts.next().and_then(|v| v.trim().parse().ok()).unwrap_or(1);
+        let Some(line) = line else {
+            self.show_toast("请输入行号，例如 120 或 120:8".to_string(), ToastKind::Info, cx);
+            return;
+        };
+        if let Some(tab) = self.active_tab_mut() {
+            let n = tab.buffer.line_count();
+            let l = line.clamp(1, n) - 1;
+            let ls = tab.buffer.line_to_char(l);
+            let len = tab.buffer.line_content(l).chars().count();
+            tab.cursor = ls + (col.max(1) - 1).min(len);
+            tab.anchor = tab.cursor;
+        }
+        self.close_goto(cx);
+        self.center_cursor(window);
+        cx.notify();
+    }
+
+    /// 输入单个字符时的自动配对：成对插入括号 / 引号、跳过已存在的闭合符号、
+    /// 有选区时用符号包住选区。返回 true 表示已处理。
+    fn try_auto_pair(&mut self, text: &str, cx: &mut Context<Workspace>) -> bool {
+        if self.input_focus != InputFocus::None || self.marked.is_some() {
+            return false;
+        }
+        let mut it = text.chars();
+        let (Some(ch), None) = (it.next(), it.next()) else { return false };
+        let Some(tab) = self.active_tab() else { return false };
+        let spec = tab_spec(tab);
+        let (s, e) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
+        let prev = if s > 0 {
+            tab.buffer.slice_string(s - 1..s).chars().next()
+        } else {
+            None
+        };
+        let next = tab.buffer.slice_string(e..e + 1).chars().next();
+        match editing::pair_action(&spec, ch, prev, next, s < e) {
+            PairAction::None => false,
+            PairAction::Skip => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.cursor = s + 1;
+                    tab.anchor = tab.cursor;
+                }
+                cx.notify();
+                true
+            }
+            PairAction::Pair(close) => {
+                self.replace_range(s..e, &format!("{ch}{close}"));
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.cursor = s + 1;
+                    tab.anchor = tab.cursor;
+                }
+                cx.notify();
+                true
+            }
+            PairAction::Wrap(close) => {
+                let inner = tab.buffer.slice_string(s..e);
+                let len = inner.chars().count();
+                self.replace_range(s..e, &format!("{ch}{inner}{close}"));
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.anchor = s + 1;
+                    tab.cursor = s + 1 + len;
+                }
+                cx.notify();
+                true
+            }
+        }
+    }
+
     // ===== 编辑器编辑操作 =====
 
     fn insert_text_at_cursor(&mut self, text: &str, cx: &mut Context<Workspace>) {
@@ -693,11 +1264,42 @@ impl Workspace {
             }
             None => return,
         };
+        // 光标在一对空括号 / 空引号中间（`(|)`、`"|"`）：两个一起删。
+        if s == e && s > 0 {
+            if let Some(t) = self.active_tab() {
+                let spec = tab_spec(t);
+                let around: Vec<char> = t.buffer.slice_string(s - 1..s + 1).chars().collect();
+                if editing::deletes_pair(&spec, around.first().copied(), around.get(1).copied()) {
+                    let tab = self.active_tab_mut().unwrap();
+                    tab.buffer.remove(s - 1..s + 1);
+                    tab.cursor = s - 1;
+                    tab.anchor = s - 1;
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        // 光标前全是空格：一次删掉一级缩进（删到上一个缩进位置）。
+        let smart = if s == e {
+            self.active_tab()
+                .map(|t| {
+                    let (before, _) = line_around(&t.buffer, s, s);
+                    indent::smart_backspace(&before, &indent::indent_unit(&t.buffer, &t.name))
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let Some(tab) = self.active_tab_mut() else { return };
         if s < e {
             tab.buffer.remove(s..e);
             tab.cursor = s;
             tab.anchor = s;
+        } else if smart > 0 {
+            let from = s - smart;
+            tab.buffer.remove(from..s);
+            tab.cursor = from;
+            tab.anchor = from;
         } else if tab.cursor > 0 {
             let prev = prev_char_boundary(&tab.buffer, tab.cursor);
             tab.buffer.remove(prev..tab.cursor);
@@ -737,10 +1339,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 撤销 / 重做后光标回到被改动的位置（旧版停在原地，撤销远处的修改时看不到发生了什么）。
     fn undo(&mut self, cx: &mut Context<Workspace>) {
         let Some(tab) = self.active_tab_mut() else { return };
-        if tab.buffer.undo() {
-            tab.cursor = tab.cursor.min(tab.buffer.char_count());
+        if let Some(pos) = tab.buffer.undo_pos() {
+            tab.cursor = pos.min(tab.buffer.char_count());
             tab.anchor = tab.cursor;
             cx.notify();
         }
@@ -748,8 +1351,8 @@ impl Workspace {
 
     fn redo(&mut self, cx: &mut Context<Workspace>) {
         let Some(tab) = self.active_tab_mut() else { return };
-        if tab.buffer.redo() {
-            tab.cursor = tab.cursor.min(tab.buffer.char_count());
+        if let Some(pos) = tab.buffer.redo_pos() {
+            tab.cursor = pos.min(tab.buffer.char_count());
             tab.anchor = tab.cursor;
             cx.notify();
         }
@@ -780,7 +1383,7 @@ impl Workspace {
         }
     }
 
-    // ===== 编辑器几何 / 绘制 / 命中测试 =====
+    // ===== 编辑器几何 / 排版缓存 / 命中测试 =====
 
     fn geometry(&self, bounds: &Bounds<Pixels>) -> Geom {
         let w = f32::from(bounds.size.width);
@@ -790,9 +1393,10 @@ impl Workspace {
         let gutter_w = (digits as f32 * 8.0 + 16.0).max(44.0);
         let content_top = 10.0_f32;
         let content_left = gutter_w + 8.0;
-        let content_width = (w - content_left - 8.0).max(20.0);
+        // 右侧留出竖向滚动条的位置
+        let content_width = (w - content_left - 14.0).max(20.0);
         let content_height = (h - content_top * 2.0).max(20.0);
-        let wrap_width = content_width;
+        let wrap_width = content_width.floor();
         Geom {
             gutter_w,
             content_left,
@@ -803,113 +1407,200 @@ impl Workspace {
         }
     }
 
-    /// 计算内容总高度与最大滚动量（第一遍测量）。
+    /// 确保标签的排版缓存与当前内容 / 宽度一致。
+    fn sync_layout(&self, tab: &Tab, geom: &Geom, window: &Window) {
+        let mut lc = tab.layout.borrow_mut();
+        if lc.char_w <= 0.0 {
+            let probe = "0000000000";
+            let shaped = window.text_system().shape_line(
+                SharedString::from(probe),
+                FONT_SIZE,
+                &[mk_run(probe.len(), INK)],
+                None,
+            );
+            lc.char_w = (f32::from(shaped.width) / probe.len() as f32).max(1.0);
+        }
+        let wrap_px = if tab.wrap { geom.wrap_width } else { 0.0 };
+        let version = tab.buffer.version();
+        if lc.valid && lc.version == version && lc.wrap_px == wrap_px {
+            return;
+        }
+        if lc.wrap_px != wrap_px || lc.memo.len() > 200_000 {
+            lc.memo.clear();
+        }
+        if !lc.valid || lc.version != version {
+            lc.unit = indent::indent_unit(&tab.buffer, &tab.name);
+        }
+
+        let n = tab.buffer.line_count();
+        let lh = f32::from(LINE_HEIGHT);
+        let mut tops = Vec::with_capacity(n + 1);
+        let mut y = 0.0_f32;
+        let mut max_cols = 0usize;
+        for i in 0..n {
+            tops.push(y);
+            if wrap_px > 0.0 {
+                let lt = tab.buffer.line_content(i);
+                let key = hash_str(&lt);
+                let cached = lc.memo.get(&key).copied();
+                let rows = match cached {
+                    Some(r) => r,
+                    None => {
+                        let d = DispLine::new(&lt, TAB_W);
+                        let r = window
+                            .text_system()
+                            .shape_text(
+                                SharedString::from(d.text.clone()),
+                                FONT_SIZE,
+                                &[mk_run(d.text.len(), INK)],
+                                Some(px(wrap_px)),
+                                None,
+                            )
+                            .ok()
+                            .and_then(|w| w.first().map(|l| l.wrap_boundaries().len() as u32 + 1))
+                            .unwrap_or(1);
+                        lc.memo.insert(key, r);
+                        r
+                    }
+                };
+                y += rows as f32 * lh;
+            } else {
+                max_cols = max_cols.max(tab.buffer.line_len_chars(i));
+                y += lh;
+            }
+        }
+        tops.push(y);
+        lc.tops = tops;
+        lc.max_cols = max_cols;
+        lc.version = version;
+        lc.wrap_px = wrap_px;
+        lc.valid = true;
+    }
+
+    /// 内容总高度与最大竖向滚动量。
     fn content_metrics(&self, geom: &Geom, window: &Window) -> (f32, f32) {
         let Some(tab) = self.active_tab() else { return (0.0, 0.0) };
-        let n = tab.buffer.line_count();
-        let mut total = 0.0_f32;
-        for i in 0..n {
-            let lt = tab.buffer.line_content(i);
-            if let Ok(wrapped) = window.text_system().shape_text(
-                SharedString::from(lt.to_string()),
-                FONT_SIZE,
-                &[mk_run(lt.len(), INK)],
-                Some(px(geom.wrap_width)),
-                None,
-            ) {
-                total += (wrapped.first().map(|l| l.wrap_boundaries().len() + 1).unwrap_or(1)) as f32 * f32::from(LINE_HEIGHT);
-            } else {
-                total += f32::from(LINE_HEIGHT);
-            }
-        }
-        let max_scroll = (total - geom.content_height).max(0.0);
-        (total, max_scroll)
+        self.sync_layout(tab, geom, window);
+        let total = tab.layout.borrow().tops.last().copied().unwrap_or(0.0);
+        (total, (total - geom.content_height).max(0.0))
     }
 
-    /// 把内容空间坐标 (x 相对 content_left, y 相对 content_top) 映射到字符索引。
+    /// 最大横向滚动量（自动换行时为 0）。需先 sync_layout。
+    fn max_scroll_x(&self, tab: &Tab, geom: &Geom) -> f32 {
+        if tab.wrap {
+            return 0.0;
+        }
+        let lc = tab.layout.borrow();
+        ((lc.max_cols as f32 + 6.0) * lc.char_w - geom.content_width).max(0.0)
+    }
+
+    fn scroll_x_of(tab: &Tab) -> f32 {
+        if tab.wrap {
+            0.0
+        } else {
+            tab.scroll_x.max(0.0)
+        }
+    }
+
+    /// 排版一行（显示文本：Tab 已展开）。
+    fn shape_disp(&self, tab: &Tab, text: &str, runs: &[TextRun], geom: &Geom, window: &Window) -> Option<WrappedLine> {
+        let wrap = tab.wrap.then(|| px(geom.wrap_width));
+        window
+            .text_system()
+            .shape_text(SharedString::from(text.to_string()), FONT_SIZE, runs, wrap, None)
+            .ok()?
+            .into_iter()
+            .next()
+    }
+
+    /// 内容坐标 → 字符索引。x 相对文字起点（未减横向滚动）；
+    /// y 以编辑区顶部为 0（含上边距 content_top，已加上竖向滚动）。
     fn char_at_xy(&self, geom: &Geom, x: f32, y: f32, window: &Window) -> usize {
         let Some(tab) = self.active_tab() else { return 0 };
-        let n = tab.buffer.line_count();
-        let mut yy = geom.content_top;
-        for i in 0..n {
-            let lt = tab.buffer.line_content(i);
-            let wrapped = window
-                .text_system()
-                .shape_text(
-                    SharedString::from(lt.to_string()),
-                    FONT_SIZE,
-                    &[mk_run(lt.len(), INK)],
-                    Some(px(geom.wrap_width)),
-                    None,
-                )
-                .unwrap_or_default();
-            let Some(line0) = wrapped.first() else { continue };
-            let vc = line0.wrap_boundaries().len() + 1;
-            let h = vc as f32 * f32::from(LINE_HEIGHT);
-            if y < yy + h {
-                let local_y = (y - yy).max(0.0);
-                let wix = (local_y / f32::from(LINE_HEIGHT)).floor() as usize;
-                let pos = point(px(x.max(0.0)), px(wix as f32 * f32::from(LINE_HEIGHT)));
-                let byte = line0
-                    .closest_index_for_position(pos, LINE_HEIGHT)
-                    .unwrap_or_else(|e| e);
-                let lcs = tab.buffer.line_to_char(i);
-                let char_off = lt[..byte.min(lt.len())].chars().count();
-                return lcs + char_off;
+        self.sync_layout(tab, geom, window);
+        let yc = y - geom.content_top;
+        let (line, top) = {
+            let lc = tab.layout.borrow();
+            if yc >= lc.tops.last().copied().unwrap_or(0.0) {
+                return tab.buffer.char_count();
             }
-            yy += h;
-        }
-        tab.buffer.char_count()
+            let l = line_at_y(&lc.tops, yc.max(0.0));
+            (l, lc.tops.get(l).copied().unwrap_or(0.0))
+        };
+        let lt = tab.buffer.line_content(line);
+        let d = DispLine::new(&lt, TAB_W);
+        let lcs = tab.buffer.line_to_char(line);
+        let Some(wl) = self.shape_disp(tab, &d.text, &[mk_run(d.text.len(), INK)], geom, window) else {
+            return lcs;
+        };
+        let lh = f32::from(LINE_HEIGHT);
+        let row = ((yc - top).max(0.0) / lh).floor();
+        let pos = point(px(x.max(0.0)), px(row * lh + lh * 0.5));
+        let b = wl
+            .closest_index_for_position(pos, LINE_HEIGHT)
+            .unwrap_or_else(|e| e)
+            .min(d.text.len());
+        lcs + d.disp_to_char(b)
     }
 
-    /// 计算当前光标在内容空间中的 (x, y)（y 相对 content_top）。
+    /// 光标位置：x 相对文字起点（未减横向滚动），y 含上边距（未减竖向滚动）。
     fn caret_xy(&self, geom: &Geom, window: &Window) -> Option<(f32, f32)> {
         let tab = self.active_tab()?;
-        let cursor = tab.cursor;
-        let line = tab.buffer.char_to_line(cursor);
-        let visible = tab.buffer.line_content(line);
-        let lcs = tab.buffer.line_to_char(line);
-        let local_char = cursor - lcs;
-        let byte = visible
-            .char_indices()
-            .nth(local_char)
-            .map(|(b, _)| b)
-            .unwrap_or(visible.len());
-        let wrapped = window
-            .text_system()
-            .shape_text(
-                SharedString::from(visible.to_string()),
-                FONT_SIZE,
-                &[mk_run(visible.len(), INK)],
-                Some(px(geom.wrap_width)),
-                None,
-            )
-            .unwrap_or_default();
-        let line0 = wrapped.first()?;
-        let pos = line0.position_for_index(byte, LINE_HEIGHT)?;
-        let mut yy = geom.content_top;
-        for i in 0..line {
-            let l = tab.buffer.line_content(i);
-            let w = window
-                .text_system()
-                .shape_text(
-                    SharedString::from(l.to_string()),
-                    FONT_SIZE,
-                    &[mk_run(l.len(), INK)],
-                    Some(px(geom.wrap_width)),
-                    None,
-                )
-                .unwrap_or_default();
-            yy += (w.first().map(|l| l.wrap_boundaries().len() + 1).unwrap_or(1)) as f32 * f32::from(LINE_HEIGHT);
-        }
-        Some((f32::from(pos.x), yy + f32::from(pos.y)))
+        self.sync_layout(tab, geom, window);
+        let line = tab.buffer.char_to_line(tab.cursor);
+        let lt = tab.buffer.line_content(line);
+        let d = DispLine::new(&lt, TAB_W);
+        let local = tab.cursor.saturating_sub(tab.buffer.line_to_char(line));
+        let wl = self.shape_disp(tab, &d.text, &[mk_run(d.text.len(), INK)], geom, window)?;
+        let pos = wl.position_for_index(d.disp(local), LINE_HEIGHT)?;
+        let top = tab.layout.borrow().tops.get(line).copied().unwrap_or(0.0);
+        Some((f32::from(pos.x), geom.content_top + top + f32::from(pos.y)))
     }
 
-    /// 为某一逻辑行构造 `TextRun` 序列：语法着色决定前景色，选区 / 查找匹配
-    /// 决定背景色，输入法组合文本加下划线。三者可以任意重叠，这里按所有区间的
-    /// 端点切段，每段分别取前景、背景和下划线。
-    fn line_runs(&self, tab: &Tab, line_idx: usize, line_text: &str, syntax: Option<&[Span]>) -> Vec<TextRun> {
-        let len = line_text.len();
+    /// 光标旁边的括号及其配对括号（全文字符索引）。
+    fn bracket_pair(&self, tab: &Tab) -> Option<(usize, usize)> {
+        let c = tab.cursor;
+        let near = tab.buffer.slice_string(c.saturating_sub(1)..c + 1);
+        if !near.chars().any(|ch| "()[]{}".contains(ch)) {
+            return None;
+        }
+        let base = c.saturating_sub(20_000);
+        let end = (c + 20_000).min(tab.buffer.char_count());
+        let chars: Vec<char> = tab.buffer.slice_string(base..end).chars().collect();
+        editing::match_bracket(&chars, base, c)
+    }
+
+    /// 要高亮其它出现位置的单词：选中的单词，或光标所在的单词。
+    fn occurrence_needle(&self, tab: &Tab) -> Option<String> {
+        let (s, e) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
+        if s < e {
+            if e - s > 64 {
+                return None;
+            }
+            let t = tab.buffer.slice_string(s..e);
+            return t.chars().all(editing::is_word_char).then_some(t);
+        }
+        let line = tab.buffer.char_to_line(s);
+        let lt = tab.buffer.line_content(line);
+        let col = s - tab.buffer.line_to_char(line);
+        let (a, b) = editing::word_at(&lt, col)?;
+        let w: String = lt.chars().skip(a).take(b - a).collect();
+        (w.chars().count() >= 2 && !w.chars().all(|c| c.is_ascii_digit())).then_some(w)
+    }
+
+    /// 为某一逻辑行构造 `TextRun` 序列：语法着色决定前景色，选区 / 查找匹配 /
+    /// 括号配对 / 同名单词决定背景色，输入法组合文本加下划线。三者可以任意重叠，
+    /// 这里按所有区间端点切段，每段分别取前景、背景和下划线。
+    /// 所有偏移都换算到显示文本（Tab 已展开）上。
+    fn line_runs(
+        &self,
+        tab: &Tab,
+        line_idx: usize,
+        d: &DispLine,
+        syntax: Option<&[Span]>,
+        extra: &[(usize, usize, Hsla)],
+    ) -> Vec<TextRun> {
+        let len = d.text.len();
         let n = tab.buffer.line_count();
         let lcs = tab.buffer.line_to_char(line_idx);
         let lce = if line_idx + 1 < n {
@@ -917,29 +1608,32 @@ impl Workspace {
         } else {
             tab.buffer.char_count()
         };
+        let rng = |a: usize, b: usize| intersect(lcs, lce, a, b).map(|(s, e)| (d.disp(s - lcs), d.disp(e - lcs)));
 
-        // 背景区间，越靠后优先级越高：普通匹配 < 选区 < 当前匹配
+        // 背景区间，越靠后优先级越高：同名单词/括号 < 普通匹配 < 选区 < 当前匹配
         let mut bgs: Vec<(usize, usize, Hsla)> = Vec::new();
+        for &(a, b, c) in extra {
+            if let Some((x, y)) = rng(a, b) {
+                bgs.push((x, y, c));
+            }
+        }
         for (i, &(ms, me)) in self.search.matches.iter().enumerate() {
             if Some(i) == self.search.active {
                 continue;
             }
-            if let Some(seg) = intersect(lcs, lce, ms, me) {
-                let (bs, be) = byte_range_in_line(line_text, seg.0 - lcs, seg.1 - lcs);
-                bgs.push((bs, be, MATCH_HL));
+            if let Some((x, y)) = rng(ms, me) {
+                bgs.push((x, y, MATCH_HL));
             }
         }
         let (s, e) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
         if s < e {
-            if let Some(seg) = intersect(lcs, lce, s, e) {
-                let (bs, be) = byte_range_in_line(line_text, seg.0 - lcs, seg.1 - lcs);
-                bgs.push((bs, be, SELECTION));
+            if let Some((x, y)) = rng(s, e) {
+                bgs.push((x, y, SELECTION));
             }
         }
         if let Some(&(ms, me)) = self.search.active.and_then(|i| self.search.matches.get(i)) {
-            if let Some(seg) = intersect(lcs, lce, ms, me) {
-                let (bs, be) = byte_range_in_line(line_text, seg.0 - lcs, seg.1 - lcs);
-                bgs.push((bs, be, MATCH_HL_SEL));
+            if let Some((x, y)) = rng(ms, me) {
+                bgs.push((x, y, MATCH_HL_SEL));
             }
         }
 
@@ -947,27 +1641,28 @@ impl Workspace {
         let mut underline: Option<(usize, usize)> = None;
         if self.input_focus == InputFocus::None {
             if let Some(m) = &self.marked {
-                if let Some(seg) = intersect(lcs, lce, m.start, m.end) {
-                    underline = Some(byte_range_in_line(line_text, seg.0 - lcs, seg.1 - lcs));
-                }
+                underline = rng(m.start, m.end);
             }
         }
 
-        let spans: &[Span] = syntax.unwrap_or(&[]);
+        let spans: Vec<Span> = syntax
+            .unwrap_or(&[])
+            .iter()
+            .map(|&(a, b, c)| (d.orig_to_disp(a), d.orig_to_disp(b), c))
+            .collect();
 
-        // 所有端点
         let mut cuts: Vec<usize> = vec![0, len];
-        for &(a, b, _) in spans {
+        for &(a, b, _) in &spans {
             cuts.push(a.min(len));
             cuts.push(b.min(len));
         }
         for &(a, b, _) in &bgs {
-            cuts.push(a);
-            cuts.push(b);
+            cuts.push(a.min(len));
+            cuts.push(b.min(len));
         }
         if let Some((a, b)) = underline {
-            cuts.push(a);
-            cuts.push(b);
+            cuts.push(a.min(len));
+            cuts.push(b.min(len));
         }
         cuts.sort_unstable();
         cuts.dedup();
@@ -993,7 +1688,6 @@ impl Workspace {
                 .map(|&(_, _, c)| c);
             let ul = underline.is_some_and(|(us, ue)| us <= a && a < ue);
 
-            // 与上一段样式完全相同就合并，减少 TextRun 数量
             if let Some(last) = runs.last_mut() {
                 if last.color == fg && last.background_color == bg && last.underline.is_some() == ul {
                     last.len += b - a;
@@ -1026,19 +1720,17 @@ impl Workspace {
         };
         let (total, max_scroll) = self.content_metrics(&geom, window);
         let scroll = tab.scroll.max(0.0).min(max_scroll);
+        let max_sx = self.max_scroll_x(tab, &geom);
+        let scroll_x = Self::scroll_x_of(tab);
+        let lh = f32::from(LINE_HEIGHT);
+        let ox = f32::from(bounds.origin.x);
+        let oy = f32::from(bounds.origin.y);
 
-        let view_top = f32::from(bounds.origin.y) + geom.content_top;
-        let view_bottom = f32::from(bounds.origin.y) + f32::from(bounds.size.height) - geom.content_top;
-
-        // 行号槽背景
+        // 行号槽背景与分隔线
         window.paint_quad(fill(
-            Bounds::new(
-                point(bounds.origin.x, bounds.origin.y),
-                size(px(geom.gutter_w), bounds.size.height),
-            ),
+            Bounds::new(point(bounds.origin.x, bounds.origin.y), size(px(geom.gutter_w), bounds.size.height)),
             BG_PANEL,
         ));
-        // 分隔线
         window.paint_quad(fill(
             Bounds::new(
                 point(bounds.origin.x + px(geom.gutter_w) - px(1.0), bounds.origin.y),
@@ -1047,96 +1739,135 @@ impl Workspace {
             BORDER,
         ));
 
+        let n = tab.buffer.line_count();
+        if n == 0 {
+            return;
+        }
         let caret_line = tab.buffer.char_to_line(tab.cursor);
         let (sel_s, sel_e) = (tab.anchor.min(tab.cursor), tab.anchor.max(tab.cursor));
-        let mut y = f32::from(bounds.origin.y) + geom.content_top - scroll;
-        let n = tab.buffer.line_count();
 
-        // 语法高亮：遇到第一条可见行时，一次性把高亮推进到可视区域末尾。
-        // 每条逻辑行至少占一个视觉行，所以可见行数不超过 视口高度 / 行高。
+        // 可见行范围（二分查找）
+        let (first, last, char_w, unit_cols) = {
+            let lc = tab.layout.borrow();
+            let f = line_at_y(&lc.tops, scroll);
+            let l = line_at_y(&lc.tops, scroll + geom.content_height + lh);
+            let uc = if lc.unit == "\t" { TAB_W } else { lc.unit.len().max(1) };
+            (f, l.min(n - 1), lc.char_w, uc)
+        };
+
+        // 语法高亮推进到可视区域末尾
         let mut syntax = tab.syntax.borrow_mut();
         syntax.refresh(&tab.name, &tab.buffer);
-        let visible_rows = (geom.content_height / f32::from(LINE_HEIGHT)).ceil() as usize + 2;
-        let mut highlighted = false;
+        syntax.ensure_upto(&tab.buffer, last);
 
-        for line_idx in 0..n {
+        let brackets = self.bracket_pair(tab);
+        let needle = self.occurrence_needle(tab);
+        let focused = self.focus_handle.is_focused(window) && self.input_focus == InputFocus::None;
+        let text_left = ox + geom.content_left - scroll_x;
+        // 文字区域裁剪：横向滚动时文字不会画到行号槽上
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(px(ox + geom.content_left - 2.0), bounds.origin.y),
+                size(px(geom.content_width + 6.0), bounds.size.height),
+            ),
+        };
+
+        // 空行的缩进参考线：取上下最近非空行缩进的较小值
+        let indent_of = |i: usize| -> Option<usize> {
+            let l = tab.buffer.line_content(i);
+            (!l.trim().is_empty()).then(|| ws_width(&l))
+        };
+        let mut prev_indent = (0..first).rev().take(200).find_map(|i| indent_of(i)).unwrap_or(0);
+
+        for line_idx in first..=last {
+            let (top_c, bottom_c) = {
+                let lc = tab.layout.borrow();
+                (lc.tops[line_idx], lc.tops[line_idx + 1])
+            };
+            let h = bottom_c - top_c;
+            let line_top = oy + geom.content_top + top_c - scroll;
             let lt = tab.buffer.line_content(line_idx);
-            // 先用无样式的排版算出本行高度，判断是否可见；不可见的行不着色。
-            let h_probe = window
-                .text_system()
-                .shape_text(
-                    SharedString::from(lt.to_string()),
-                    FONT_SIZE,
-                    &[mk_run(lt.len(), INK)],
-                    Some(px(geom.wrap_width)),
-                    None,
-                )
-                .ok()
-                .and_then(|w| w.first().map(|l| l.wrap_boundaries().len() + 1))
-                .unwrap_or(1) as f32
-                * f32::from(LINE_HEIGHT);
-            if y + h_probe < view_top - 60.0 || y > view_bottom + 60.0 {
-                y += h_probe;
-                continue;
-            }
-            if !highlighted {
-                syntax.ensure_upto(&tab.buffer, line_idx + visible_rows);
-                highlighted = true;
-            }
-            let runs = self.line_runs(tab, line_idx, &lt, syntax.spans(line_idx));
-            let wrapped = window
-                .text_system()
-                .shape_text(
-                    SharedString::from(lt.to_string()),
-                    FONT_SIZE,
-                    &runs,
-                    Some(px(geom.wrap_width)),
-                    None,
-                )
-                .unwrap_or_default();
-            let vc = wrapped.first().map(|l| l.wrap_boundaries().len() + 1).unwrap_or(1);
-            let h = vc as f32 * f32::from(LINE_HEIGHT);
-            let line_top = y;
-            let line_bottom = y + h;
+            let d = DispLine::new(&lt, TAB_W);
+            let lcs = tab.buffer.line_to_char(line_idx);
 
-            if line_bottom < view_top - 60.0 || line_top > view_bottom + 60.0 {
-                y += h;
-                continue;
+            let mut extra: Vec<(usize, usize, Hsla)> = Vec::new();
+            if let Some(nd) = &needle {
+                for (a, b) in editing::word_occurrences(&lt, nd) {
+                    extra.push((lcs + a, lcs + b, OCCURRENCE_HL));
+                }
             }
+            if let Some((a, b)) = brackets {
+                extra.push((a, a + 1, BRACKET_HL));
+                extra.push((b, b + 1, BRACKET_HL));
+            }
+            let runs = self.line_runs(tab, line_idx, &d, syntax.spans(line_idx), &extra);
+            let Some(wl) = self.shape_disp(tab, &d.text, &runs, &geom, window) else {
+                continue;
+            };
 
             // 当前行高亮
             if line_idx == caret_line {
                 window.paint_quad(fill(
                     Bounds::new(
-                        point(bounds.origin.x + px(geom.content_left), px(line_top)),
+                        point(px(ox + geom.content_left), px(line_top)),
                         size(px(geom.content_width), px(h)),
                     ),
                     BG_ACTIVE,
                 ));
             }
 
-            let origin = point(bounds.origin.x + px(geom.content_left), px(line_top));
-            if let Some(line0) = wrapped.first() {
-                let _ = line0.paint_background(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx);
-                let _ = line0.paint(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx);
+            // 缩进参考线的层数
+            let indent_cols = match indent_of(line_idx) {
+                Some(w) => {
+                    prev_indent = w;
+                    w
+                }
+                None => {
+                    let next = (line_idx + 1..n).take(200).find_map(|i| indent_of(i)).unwrap_or(0);
+                    prev_indent.min(next)
+                }
+            };
+            let levels = indent_cols / unit_cols;
 
-                // 选区包含本行的换行符：在行尾补一小块选区色。TextRun 的背景色
-                // 只覆盖字形，空行或行尾换行被选中时原本没有任何视觉反馈。
+            window.with_content_mask(Some(mask.clone()), |window| {
+                for k in 0..levels {
+                    let x = text_left + (k * unit_cols) as f32 * char_w;
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(x.round() + 0.5), px(line_top)), size(px(1.0), px(h))),
+                        INDENT_GUIDE,
+                    ));
+                }
+
+                let origin = point(px(text_left), px(line_top));
+                let _ = wl.paint_background(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx);
+                let _ = wl.paint(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx);
+
+                // 选区包含本行的换行符：在行尾补一小块选区色。
                 if sel_s < sel_e && line_idx + 1 < n {
-                    let nl = tab.buffer.line_to_char(line_idx) + lt.chars().count();
+                    let nl = lcs + lt.chars().count();
                     if sel_s <= nl && nl < sel_e {
-                        if let Some(p) = line0.position_for_index(lt.len(), LINE_HEIGHT) {
+                        if let Some(p) = wl.position_for_index(d.text.len(), LINE_HEIGHT) {
                             window.paint_quad(fill(
-                                Bounds::new(
-                                    point(origin.x + p.x, px(line_top) + p.y),
-                                    size(px(7.0), LINE_HEIGHT),
-                                ),
+                                Bounds::new(point(origin.x + p.x, px(line_top) + p.y), size(px(7.0), LINE_HEIGHT)),
                                 SELECTION,
                             ));
                         }
                     }
                 }
-            }
+
+                // 光标
+                if focused && line_idx == caret_line {
+                    let local = tab.cursor - lcs;
+                    if let Some(pos) = wl.position_for_index(d.disp(local), LINE_HEIGHT) {
+                        let caret_h = lh * 0.8;
+                        let caret_y = line_top + f32::from(pos.y) + (lh - caret_h) / 2.0;
+                        window.paint_quad(fill(
+                            Bounds::new(point(origin.x + pos.x, px(caret_y)), size(px(1.6), px(caret_h))),
+                            ACCENT,
+                        ));
+                    }
+                }
+            });
 
             // 行号（仅逻辑行首显示）
             let num_color = if line_idx == caret_line { ACCENT } else { INK_FAINT };
@@ -1151,55 +1882,32 @@ impl Workspace {
             };
             let shaped = window
                 .text_system()
-                .shape_line(SharedString::from(num_str.to_string()), FONT_SIZE, &[num_run], None);
-            let num_x = f32::from(bounds.origin.x) + geom.gutter_w - 8.0 - f32::from(shaped.width);
+                .shape_line(SharedString::from(num_str), FONT_SIZE, &[num_run], None);
+            let num_x = ox + geom.gutter_w - 8.0 - f32::from(shaped.width);
             let _ = shaped.paint(point(px(num_x), px(line_top)), LINE_HEIGHT, window, cx);
-
-            // 光标
-            if self.focus_handle.is_focused(window)
-                && self.input_focus == InputFocus::None
-                && line_idx == caret_line
-            {
-                let local_char = tab.cursor - tab.buffer.line_to_char(line_idx);
-                let byte = lt
-                    .char_indices()
-                    .nth(local_char)
-                    .map(|(b, _)| b)
-                    .unwrap_or(lt.len());
-                if let Some(pos) = wrapped.first().and_then(|l| l.position_for_index(byte, LINE_HEIGHT)) {
-                    let caret_x = f32::from(bounds.origin.x) + geom.content_left + f32::from(pos.x);
-                    let caret_h = f32::from(LINE_HEIGHT) * 0.8;
-                    let caret_y = line_top + f32::from(pos.y) + (f32::from(LINE_HEIGHT) - caret_h) / 2.0;
-                    window.paint_quad(fill(
-                        Bounds::new(point(px(caret_x), px(caret_y)), size(px(1.6), px(caret_h))),
-                        ACCENT,
-                    ));
-                }
-            }
-
-            y += h;
         }
+        drop(syntax);
 
-        // 滚动条
+        // 竖向滚动条
         if max_scroll > 0.0 {
-            let track_top = f32::from(bounds.origin.y) + geom.content_top;
+            let track_top = oy + geom.content_top;
             let track_h = geom.content_height;
-            let thumb_h = (geom.content_height / total.max(1.0)) * track_h;
+            let thumb_h = ((geom.content_height / total.max(1.0)) * track_h).max(24.0).min(track_h);
             let thumb_top = track_top + (scroll / max_scroll) * (track_h - thumb_h);
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(bounds.origin.x + bounds.size.width - px(10.0), px(track_top)),
-                    size(px(6.0), px(track_h)),
-                ),
-                BORDER,
-            ));
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(bounds.origin.x + bounds.size.width - px(10.0), px(thumb_top)),
-                    size(px(6.0), px(thumb_h)),
-                ),
-                INK_FAINT,
-            ));
+            let x = bounds.origin.x + bounds.size.width - px(10.0);
+            window.paint_quad(fill(Bounds::new(point(x, px(track_top)), size(px(6.0), px(track_h))), BORDER));
+            window.paint_quad(fill(Bounds::new(point(x, px(thumb_top)), size(px(6.0), px(thumb_h))), INK_FAINT));
+        }
+        // 横向滚动条（不换行且有超长行时）
+        if !tab.wrap && max_sx > 0.0 {
+            let track_left = ox + geom.content_left;
+            let track_w = geom.content_width;
+            let thumb_w = ((geom.content_width / (geom.content_width + max_sx)) * track_w).max(24.0);
+            let ratio = (scroll_x / max_sx).clamp(0.0, 1.0);
+            let thumb_left = track_left + ratio * (track_w - thumb_w);
+            let y = bounds.origin.y + bounds.size.height - px(8.0);
+            window.paint_quad(fill(Bounds::new(point(px(track_left), y), size(px(track_w), px(5.0))), BORDER));
+            window.paint_quad(fill(Bounds::new(point(px(thumb_left), y), size(px(thumb_w), px(5.0))), INK_FAINT));
         }
     }
 }
@@ -1247,15 +1955,27 @@ impl Render for Workspace {
                 syn.refresh(&t.name, &t.buffer);
                 syn.language().to_string()
             };
-            (
+            let line = t.buffer.char_to_line(t.cursor);
+            let lt = t.buffer.line_content(line);
+            let col = DispLine::new(&lt, TAB_W).col(t.cursor - t.buffer.line_to_char(line)) + 1;
+            let unit = indent::indent_unit(&t.buffer, &t.name);
+            let selected = t.anchor.max(t.cursor) - t.anchor.min(t.cursor);
+            StatusInfo {
                 language,
-                t.encoding.clone(),
-                t.eol.clone(),
-                t.buffer.char_count(),
-                t.buffer.line_count(),
-                t.path.clone().unwrap_or_else(|| "未保存到磁盘".to_string()),
-            )
+                encoding: t.encoding.clone(),
+                eol: t.eol.clone(),
+                chars: t.buffer.char_count(),
+                lines: t.buffer.line_count(),
+                path: t.path.clone().unwrap_or_else(|| "未保存到磁盘".to_string()),
+                line: line + 1,
+                col,
+                selected,
+                indent: if unit == "\t" { "Tab".to_string() } else { format!("空格: {}", unit.len()) },
+                wrap: t.wrap,
+            }
         });
+        let wrap_on = active.map(|t| t.wrap).unwrap_or(false);
+        let goto_open = self.goto.is_some();
 
         div()
             // GPUI 的 Div 默认 display:Block；flex_col()/flex_1() 只有在显式
@@ -1280,6 +2000,7 @@ impl Render for Workspace {
             .child(toolbar(
                 sidebar_visible,
                 active.is_some(),
+                wrap_on,
                 &entity,
             ))
             .child({
@@ -1309,9 +2030,13 @@ impl Render for Workspace {
                         let up_entity = entity.clone();
                         let ime_focus = focus_handle.clone();
                         canvas(
-                            move |bounds, _window, cx| {
+                            move |bounds, window, cx| {
                                 prepaint_entity.update(cx, |view, _cx| {
                                     view.editor_bounds = bounds;
+                                    if view.reveal_cursor {
+                                        view.reveal_cursor = false;
+                                        view.center_cursor(window);
+                                    }
                                 });
                             },
                             move |bounds, _pre, window, cx| {
@@ -1358,7 +2083,8 @@ impl Render for Workspace {
                             .child(editor)
                             .when(search_visible, |area| {
                                 area.child(search_panel(&*self, &entity))
-                            }),
+                            })
+                            .when(goto_open, |area| area.child(goto_panel(&*self, &entity))),
                     )
             })
             .child(status_bar(status))
@@ -1451,6 +2177,16 @@ impl Workspace {
                 }
                 return;
             }
+            InputFocus::GotoLine => {
+                match event.keystroke.key.to_ascii_lowercase().as_str() {
+                    "enter" => self.confirm_goto(window, cx),
+                    "escape" => self.close_goto(cx),
+                    _ => {
+                        self.field_key(event, cx);
+                    }
+                }
+                return;
+            }
             InputFocus::None => {}
         }
 
@@ -1516,11 +2252,54 @@ impl Workspace {
                 // Ctrl+←/→ 按词移动（move_cursor 内部识别 control）
                 "left" => self.move_cursor(-1, mods, cx),
                 "right" => self.move_cursor(1, mods, cx),
+                // ── 代码编辑 ──
+                "/" => self.toggle_comment(cx),
+                "]" => self.shift_lines_cmd(false, true, cx),
+                "[" => self.shift_lines_cmd(true, true, cx),
+                // Ctrl+Shift+\：Windows 上 Shift+\ 会被转成 "|" 且清掉 shift
+                "|" => self.jump_to_bracket(cx),
+                "\\" if shift => self.jump_to_bracket(cx),
+                "k" if shift => self.delete_lines(cx),
+                "d" if shift => self.duplicate_lines(true, cx),
+                "l" => self.select_line(cx),
+                "g" => {
+                    self.open_goto(cx);
+                    return;
+                }
+                "enter" => self.insert_line(!shift, cx),
+                // Ctrl+↑/↓：只滚动视图，不移动光标
+                "up" | "down" => {
+                    let lh = f32::from(LINE_HEIGHT);
+                    let bounds = self.editor_bounds;
+                    let geom = self.geometry(&bounds);
+                    let (_t, max_scroll) = self.content_metrics(&geom, window);
+                    if let Some(tab) = self.active_tab_mut() {
+                        let d = if key == "up" { -lh } else { lh };
+                        tab.scroll = (tab.scroll + d).clamp(0.0, max_scroll);
+                    }
+                    cx.notify();
+                    return;
+                }
                 _ => return,
             }
-            if matches!(key.as_str(), "x" | "v" | "z" | "y" | "home" | "end" | "left" | "right") {
+            if !matches!(key.as_str(), "c" | "a" | "l") {
                 self.ensure_cursor_visible(window);
             }
+            return;
+        }
+
+        // Alt 组合键（不含 Ctrl）
+        if mods.alt {
+            match key.as_str() {
+                "up" if mods.shift => self.duplicate_lines(false, cx),
+                "down" if mods.shift => self.duplicate_lines(true, cx),
+                "up" => self.move_lines(true, cx),
+                "down" => self.move_lines(false, cx),
+                "z" => self.toggle_wrap(cx),
+                "a" if mods.shift => self.toggle_block_comment(cx),
+                _ => return,
+            }
+            self.ensure_cursor_visible(window);
             return;
         }
 
@@ -1533,7 +2312,9 @@ impl Workspace {
                 }
             }
             "escape" => {
-                if self.search.visible {
+                if self.goto.is_some() {
+                    self.close_goto(cx);
+                } else if self.search.visible {
                     self.close_search(cx);
                 } else if let Some(tab) = self.active_tab_mut() {
                     tab.anchor = tab.cursor;
@@ -1542,8 +2323,8 @@ impl Workspace {
             }
             "backspace" => self.backspace(cx),
             "delete" => self.delete_forward(cx),
-            "enter" => self.insert_text_at_cursor("\n", cx),
-            "tab" => self.insert_text_at_cursor("\t", cx),
+            "enter" => self.newline(cx),
+            "tab" => self.tab_key(mods.shift, cx),
             "space" => self.insert_text_at_cursor(" ", cx),
             "left" => self.move_cursor(-1, mods, cx),
             "right" => self.move_cursor(1, mods, cx),
@@ -1628,10 +2409,14 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Home：在「第一个非空白字符」和「行首」之间切换（智能 Home）。
     fn cursor_line_start(&mut self, extend: bool, cx: &mut Context<Workspace>) {
         let Some(tab) = self.active_tab_mut() else { return };
         let line = tab.buffer.char_to_line(tab.cursor);
-        tab.cursor = tab.buffer.line_to_char(line);
+        let ls = tab.buffer.line_to_char(line);
+        let content = tab.buffer.line_content(line);
+        let first = ls + leading_ws(&content).chars().count();
+        tab.cursor = if tab.cursor == first { ls } else { first };
         if !extend {
             tab.anchor = tab.cursor;
         }
@@ -1662,8 +2447,11 @@ impl Workspace {
         let geom = self.geometry(&bounds);
         let local_x = f32::from(pos.x) - f32::from(bounds.origin.x);
         let local_y = f32::from(pos.y) - f32::from(bounds.origin.y);
-        let scroll = self.active_tab().map(|t| t.scroll).unwrap_or(0.0);
-        let x = (local_x - geom.content_left).max(0.0);
+        let (scroll, scroll_x) = self
+            .active_tab()
+            .map(|t| (t.scroll, Self::scroll_x_of(t)))
+            .unwrap_or((0.0, 0.0));
+        let x = (local_x - geom.content_left).max(0.0) + scroll_x;
         let y = (local_y + scroll).max(geom.content_top);
         self.char_at_xy(&geom, x, y, window)
     }
@@ -1802,15 +2590,16 @@ impl Workspace {
         }
     }
 
-    /// 让光标保持在可视区域内（键盘移动、输入、粘贴、撤销后调用）。
+    /// 让光标保持在可视区域内（键盘移动、输入、粘贴、撤销后调用），竖向和横向都跟随。
     fn ensure_cursor_visible(&mut self, window: &Window) {
         let bounds = self.editor_bounds;
         if f32::from(bounds.size.height) <= 0.0 {
             return;
         }
         let geom = self.geometry(&bounds);
-        let Some((_x, y)) = self.caret_xy(&geom, window) else { return };
+        let Some((x, y)) = self.caret_xy(&geom, window) else { return };
         let (_total, max_scroll) = self.content_metrics(&geom, window);
+        let char_w = self.active_tab().map(|t| t.layout.borrow().char_w).unwrap_or(8.0);
         let line_h = f32::from(LINE_HEIGHT);
         let Some(tab) = self.active_tab_mut() else { return };
         // caret_xy 的 y 含上边距，换算成内容坐标
@@ -1821,18 +2610,54 @@ impl Workspace {
             tab.scroll = caret_top + line_h - geom.content_height;
         }
         tab.scroll = tab.scroll.clamp(0.0, max_scroll);
+
+        if !tab.wrap {
+            let margin = char_w * 4.0;
+            if x < tab.scroll_x + margin {
+                tab.scroll_x = (x - margin).max(0.0);
+            } else if x > tab.scroll_x + geom.content_width - margin {
+                tab.scroll_x = x - geom.content_width + margin;
+            }
+        }
+    }
+
+    /// 光标不在视口内时，把它所在行滚动到视口中间（转到行、查找跳转后使用）。
+    fn center_cursor(&mut self, window: &Window) {
+        let bounds = self.editor_bounds;
+        let geom = self.geometry(&bounds);
+        let Some((_x, y)) = self.caret_xy(&geom, window) else { return };
+        let (_t, max_scroll) = self.content_metrics(&geom, window);
+        let lh = f32::from(LINE_HEIGHT);
+        if let Some(tab) = self.active_tab_mut() {
+            let caret_top = y - geom.content_top;
+            let visible = caret_top >= tab.scroll && caret_top + lh <= tab.scroll + geom.content_height;
+            if !visible {
+                tab.scroll = (caret_top - geom.content_height / 2.0).clamp(0.0, max_scroll);
+            }
+        }
+        self.ensure_cursor_visible(window);
     }
 
     fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, window: &Window, cx: &mut Context<Workspace>) {
-        let delta = match event.delta {
-            ScrollDelta::Pixels(p) => f32::from(p.y),
-            ScrollDelta::Lines(l) => l.y * f32::from(LINE_HEIGHT) * 3.0,
+        let lh = f32::from(LINE_HEIGHT);
+        let (mut dx, mut dy) = match event.delta {
+            ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
+            ScrollDelta::Lines(l) => (l.x * lh * 3.0, l.y * lh * 3.0),
         };
+        // Shift+滚轮 = 横向滚动
+        if event.modifiers.shift && dx == 0.0 {
+            dx = dy;
+            dy = 0.0;
+        }
         let bounds = self.editor_bounds;
         let geom = self.geometry(&bounds);
         let (_total, max_scroll) = self.content_metrics(&geom, window);
+        let max_sx = self.active_tab().map(|t| self.max_scroll_x(t, &geom)).unwrap_or(0.0);
         let Some(tab) = self.active_tab_mut() else { return };
-        tab.scroll = (tab.scroll - delta).max(0.0).min(max_scroll);
+        tab.scroll = (tab.scroll - dy).max(0.0).min(max_scroll);
+        if !tab.wrap {
+            tab.scroll_x = (tab.scroll_x - dx).clamp(0.0, max_sx.max(0.0));
+        }
         cx.notify();
     }
 
@@ -1867,6 +2692,7 @@ fn field_slot(f: InputFocus) -> Option<usize> {
         InputFocus::NewFileName => Some(0),
         InputFocus::SearchFind => Some(1),
         InputFocus::SearchReplace => Some(2),
+        InputFocus::GotoLine => Some(3),
         InputFocus::None => None,
     }
 }
@@ -2081,6 +2907,15 @@ impl Workspace {
 
 // ===== 自由函数：文本 / 索引辅助 =====
 
+/// 光标所在行光标之前的文字，以及选区末尾所在行选区末尾之后的文字（都不含换行符）。
+fn line_around(buf: &Buffer, s: usize, e: usize) -> (String, String) {
+    let sl = buf.char_to_line(s);
+    let before: String = buf.line_content(sl).chars().take(s - buf.line_to_char(sl)).collect();
+    let el = buf.char_to_line(e);
+    let after: String = buf.line_content(el).chars().skip(e - buf.line_to_char(el)).collect();
+    (before, after)
+}
+
 fn intersect(a0: usize, a1: usize, b0: usize, b1: usize) -> Option<(usize, usize)> {
     let s = a0.max(b0);
     let e = a1.min(b1);
@@ -2089,21 +2924,6 @@ fn intersect(a0: usize, a1: usize, b0: usize, b1: usize) -> Option<(usize, usize
     } else {
         None
     }
-}
-
-fn byte_range_in_line(line_text: &str, char_s: usize, char_e: usize) -> (usize, usize) {
-    let mut start = line_text.len();
-    let mut end = line_text.len();
-    for (ci, (b, _)) in line_text.char_indices().enumerate() {
-        if ci == char_s {
-            start = b;
-        }
-        if ci == char_e {
-            end = b;
-            break;
-        }
-    }
-    (start, end)
 }
 
 fn prev_char_boundary(_buf: &Buffer, idx: usize) -> usize {
@@ -2279,6 +3099,7 @@ impl Workspace {
             InputFocus::NewFileName => self.new_file.as_ref().map(|d| &d.name),
             InputFocus::SearchFind => Some(&self.search.pattern),
             InputFocus::SearchReplace => Some(&self.search.replace),
+            InputFocus::GotoLine => self.goto.as_ref(),
         }
     }
 
@@ -2288,6 +3109,7 @@ impl Workspace {
             InputFocus::NewFileName => self.new_file.as_mut().map(|d| &mut d.name),
             InputFocus::SearchFind => Some(&mut self.search.pattern),
             InputFocus::SearchReplace => Some(&mut self.search.replace),
+            InputFocus::GotoLine => self.goto.as_mut(),
         }
     }
 
@@ -2477,7 +3299,14 @@ impl EntityInputHandler for Workspace {
         if self.ime_len().is_none() {
             return;
         }
-        let r = self.ime_target_range(range);
+        if self.try_auto_pair(text, cx) {
+            self.ensure_cursor_visible(window);
+            return;
+        }
+        let r = match (range.is_none(), self.closer_dedent_range(text)) {
+            (true, Some(r)) => r,
+            _ => self.ime_target_range(range),
+        };
         self.ime_replace(r, text, false);
         if self.input_focus == InputFocus::SearchFind {
             self.sync_search();
@@ -2531,9 +3360,10 @@ impl EntityInputHandler for Workspace {
             let geom = self.geometry(&element_bounds);
             let (x, y) = self.caret_xy(&geom, window)?;
             let scroll = self.active_tab()?.scroll.max(0.0);
+            let scroll_x = Self::scroll_x_of(self.active_tab()?);
             Some(Bounds::new(
                 point(
-                    element_bounds.origin.x + px(geom.content_left + x),
+                    element_bounds.origin.x + px(geom.content_left + x - scroll_x),
                     element_bounds.origin.y + px(y - scroll),
                 ),
                 size(px(2.0), LINE_HEIGHT),
@@ -2699,7 +3529,10 @@ fn title_bar(active: Option<&Tab>) -> Div {
         .child(div().child(title))
 }
 
-fn toolbar(sidebar_visible: bool, has_active: bool, entity: &Entity<Workspace>) -> Div {
+fn toolbar(sidebar_visible: bool, has_active: bool, wrap_on: bool, entity: &Entity<Workspace>) -> Div {
+    let entity_g = entity.clone();
+    let entity_w = entity.clone();
+    let entity_m = entity.clone();
     let entity_c = entity.clone();
     let entity_o = entity.clone();
     let entity_s = entity.clone();
@@ -2725,6 +3558,12 @@ fn toolbar(sidebar_visible: bool, has_active: bool, entity: &Entity<Workspace>) 
         }))
         .child(div().w(px(1.0)).h(px(20.0)).bg(BORDER).mx(px(6.0)))
         .child(tool_button("查找/替换", entity_f, |ws, cx| ws.open_search(false, cx)))
+        .child(tool_button("转到行", entity_g, |ws, cx| ws.open_goto(cx)))
+        .child(tool_button("注释", entity_m, |ws, cx| ws.toggle_comment(cx)))
+        .child(
+            tool_button("自动换行", entity_w, |ws, cx| ws.toggle_wrap(cx))
+                .when(wrap_on, |b| b.text_color(ACCENT)),
+        )
         .child(div().w(px(1.0)).h(px(20.0)).bg(BORDER).mx(px(6.0)))
         .child(tool_button("设为默认", entity_d, |ws, cx| ws.set_default_for_active(cx)))
         .child(div().flex_1())
@@ -2848,33 +3687,86 @@ fn sidebar(tabs: &[(usize, String, bool, bool)], active_idx: Option<usize>, enti
         )
 }
 
-fn status_bar(status: Option<(String, String, String, usize, usize, String)>) -> Div {
+struct StatusInfo {
+    language: String,
+    encoding: String,
+    eol: String,
+    chars: usize,
+    lines: usize,
+    path: String,
+    line: usize,
+    col: usize,
+    selected: usize,
+    indent: String,
+    wrap: bool,
+}
+
+fn status_bar(status: Option<StatusInfo>) -> Div {
+    let bar = div()
+        .h(px(26.0))
+        .flex_shrink_0()
+        .bg(ACCENT)
+        .text_color(white())
+        .text_size(px(12.0))
+        .flex()
+        .items_center()
+        .px(px(14.0))
+        .gap(px(18.0));
     match status {
-        Some((language, enc, eol, chars, lines, path)) => div()
-            .h(px(26.0))
-            .flex_shrink_0()
-            .bg(ACCENT)
-            .text_color(white())
-            .flex()
-            .items_center()
-            .px(px(14.0))
-            .gap(px(18.0))
-            .child(div().child(language))
-            .child(div().child(enc))
-            .child(div().child(eol))
-            .child(div().child(format!("{} 字符 · {} 行", chars, lines)))
+        Some(st) => bar
+            .child(div().child(if st.selected > 0 {
+                format!("行 {}, 列 {}（已选 {}）", st.line, st.col, st.selected)
+            } else {
+                format!("行 {}, 列 {}", st.line, st.col)
+            }))
+            .child(div().child(st.indent))
+            .child(div().child(st.language))
+            .child(div().child(st.encoding))
+            .child(div().child(st.eol))
+            .child(div().child(if st.wrap { "自动换行" } else { "不换行" }))
+            .child(div().child(format!("{} 字符 · {} 行", st.chars, st.lines)))
             .child(div().flex_1())
-            .child(div().child(path)),
-        None => div()
-            .h(px(26.0))
-            .flex_shrink_0()
-            .bg(ACCENT)
-            .text_color(white())
-            .flex()
-            .items_center()
-            .px(px(14.0))
-            .child("没有打开的文件"),
+            .child(div().overflow_hidden().whitespace_nowrap().child(st.path)),
+        None => bar.child("没有打开的文件"),
     }
+}
+
+/// 「转到行」面板（Ctrl+G），浮在编辑区顶部中间。
+fn goto_panel(ws: &Workspace, entity: &Entity<Workspace>) -> Div {
+    let text = ws.goto.clone().unwrap_or_default();
+    let total = ws.active_tab().map(|t| t.buffer.line_count()).unwrap_or(1);
+    let e_close = entity.clone();
+    div()
+        .absolute()
+        .top(px(10.0))
+        .left(px(0.0))
+        .right(px(0.0))
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .w(px(340.0))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                .bg(BG_APP)
+                .border(px(1.0))
+                .border_color(BORDER_STRONG)
+                .rounded(px(8.0))
+                .shadow_lg()
+                .p(px(12.0))
+                .text_color(INK)
+                .child(field_label(&format!("转到行（1 – {total}），也可以写 行:列")))
+                .child(text_field(ws, InputFocus::GotoLine, &text, "例如 120 或 120:8", entity))
+                .child(
+                    div()
+                        .mt(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_size(px(11.0)).text_color(INK_FAINT).child("回车跳转 · Esc 取消"))
+                        .child(sp_button(e_close, "关闭", |ws, cx| ws.close_goto(cx))),
+                ),
+        )
 }
 
 /// 单行输入框：显示文字、选区与光标；点击定位光标。

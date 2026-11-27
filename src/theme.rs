@@ -40,6 +40,12 @@ pub const SELECTION: Hsla = hsla(0.60, 0.83, 0.56, 0.28);
 /// 查找匹配高亮（原 CSS: rgba(224,164,88,0.35)）
 pub const MATCH_HL: Hsla = hsla(0.09, 0.72, 0.62, 0.35);
 pub const MATCH_HL_SEL: Hsla = hsla(0.60, 0.83, 0.56, 0.42);
+/// 与选中词 / 光标处单词相同的其它位置
+pub const OCCURRENCE_HL: Hsla = hsla(0.60, 0.30, 0.50, 0.16);
+/// 光标旁的括号与它的配对括号
+pub const BRACKET_HL: Hsla = hsla(0.36, 0.55, 0.45, 0.30);
+/// 缩进参考线
+pub const INDENT_GUIDE: Hsla = hsl(0.60, 0.16, 0.89);
 
 /// 编辑器等宽字体族（Linux 下 fontconfig 会把 "monospace" 解析为系统等宽字体）
 pub const EDITOR_FONT: &str = "monospace";

@@ -204,6 +204,11 @@ impl SyntaxCache {
         }
     }
 
+    /// 识别出的 syntect 语法名；纯文本时为 None。
+    pub fn syntax_name(&self) -> Option<&str> {
+        self.syntax.map(|s| s.name.as_str())
+    }
+
     /// 状态栏显示的语言名。
     pub fn language(&self) -> &str {
         self.syntax.map(|s| s.name.as_str()).unwrap_or("纯文本")
